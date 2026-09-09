@@ -14,7 +14,7 @@ export interface LoginCredentials {
   sessionPanelBase?: string;
 }
 
-export type LoginRecoveryMode = 'manager_config';
+export type LoginRecoveryMode = 'manager_config' | 'database_recovery';
 
 export interface LoginResult {
   recoveryMode?: LoginRecoveryMode;

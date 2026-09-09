@@ -4,7 +4,9 @@ import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
 import { IconEye, IconEyeOff, IconX } from '@/components/ui/icons';
+import type { ManagerCustomPageConfig } from '@/services/api/usageService';
 import { AccountProcessingPolicySection } from './AccountProcessingPolicySection';
+import { CustomMenuConfigSection } from './CustomMenuConfigSection';
 import styles from '../ConfigPage.module.scss';
 
 type ManagerConfigPanelProps = {
@@ -29,6 +31,7 @@ type ManagerConfigPanelProps = {
   managerRetentionSeconds: number;
   managerConfigSourceLabel: string;
   managerUsageStatisticsEnabled: boolean;
+  managerCustomPages: ManagerCustomPageConfig[];
   onRefresh: () => void;
   onRequestMonitoringChange: (value: boolean) => void;
   onCPABaseInputChange: (value: string) => void;
@@ -39,6 +42,7 @@ type ManagerConfigPanelProps = {
   onPollIntervalMsChange: (value: string) => void;
   onBatchSizeChange: (value: string) => void;
   onQueryLimitChange: (value: string) => void;
+  onManagerCustomPagesChange: (pages: ManagerCustomPageConfig[]) => void;
 };
 
 export function ManagerConfigPanel({
@@ -63,6 +67,7 @@ export function ManagerConfigPanel({
   managerRetentionSeconds,
   managerConfigSourceLabel,
   managerUsageStatisticsEnabled,
+  managerCustomPages,
   onRefresh,
   onRequestMonitoringChange,
   onCPABaseInputChange,
@@ -73,6 +78,7 @@ export function ManagerConfigPanel({
   onPollIntervalMsChange,
   onBatchSizeChange,
   onQueryLimitChange,
+  onManagerCustomPagesChange,
 }: ManagerConfigPanelProps) {
   const { t } = useTranslation();
   const connectionInputDisabled =
@@ -221,7 +227,9 @@ export function ManagerConfigPanel({
             labelPosition="left"
             checked={managerRequestMonitoringEnabled}
             onChange={onRequestMonitoringChange}
-            disabled={disableControls || managerLoading || !canConfigureRequestMonitoring}
+            disabled={
+              disableControls || managerLoading || managerSaving || !canConfigureRequestMonitoring
+            }
           />
         </div>
 
@@ -248,6 +256,7 @@ export function ManagerConfigPanel({
               disabled={
                 disableControls ||
                 managerLoading ||
+                managerSaving ||
                 !managerRequestMonitoringEnabled ||
                 !canConfigureRequestMonitoring
               }
@@ -264,6 +273,7 @@ export function ManagerConfigPanel({
             disabled={
               disableControls ||
               managerLoading ||
+              managerSaving ||
               !managerRequestMonitoringEnabled ||
               !canConfigureRequestMonitoring
             }
@@ -281,6 +291,7 @@ export function ManagerConfigPanel({
             disabled={
               disableControls ||
               managerLoading ||
+              managerSaving ||
               !managerRequestMonitoringEnabled ||
               !canConfigureRequestMonitoring
             }
@@ -295,12 +306,21 @@ export function ManagerConfigPanel({
             disabled={
               disableControls ||
               managerLoading ||
+              managerSaving ||
               !managerRequestMonitoringEnabled ||
               !canConfigureRequestMonitoring
             }
           />
         </div>
       </section>
+
+      <CustomMenuConfigSection
+        pages={managerCustomPages}
+        disabled={
+          disableControls || managerLoading || managerSaving || panelHostedByUsageService !== true
+        }
+        onChange={onManagerCustomPagesChange}
+      />
 
       <section className={styles.managerSection}>
         <AccountProcessingPolicySection />
@@ -313,7 +333,9 @@ export function ManagerConfigPanel({
         </div>
         <div>
           <span>{t('config_management.manager.cpa_usage_enabled')}</span>
-          <strong>{managerUsageStatisticsEnabled ? t('common.enabled') : t('common.disabled')}</strong>
+          <strong>
+            {managerUsageStatisticsEnabled ? t('common.enabled') : t('common.disabled')}
+          </strong>
         </div>
         <div>
           <span>{t('config_management.manager.cpa_retention')}</span>

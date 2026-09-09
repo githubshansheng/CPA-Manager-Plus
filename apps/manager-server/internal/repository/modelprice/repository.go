@@ -8,7 +8,10 @@ import (
 	"sort"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
+	sqldialect "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 )
 
 type Repository interface {
@@ -19,7 +22,8 @@ type Repository interface {
 }
 
 type repository struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect sqldialect.Dialect
 }
 
 type configuredFlag bool
@@ -41,7 +45,11 @@ func (f *configuredFlag) Scan(value any) error {
 }
 
 func New(db *sql.DB) Repository {
-	return &repository{db: db}
+	return NewForBackend(db, database.BackendSQLite)
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return &repository{db: db, dialect: sqldialect.ForBackend(backend)}
 }
 
 func (r *repository) LoadAll(ctx context.Context) (map[string]model.ModelPrice, error) {
@@ -215,7 +223,7 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 }
 
 func (r *repository) ReplaceAll(ctx context.Context, prices map[string]model.ModelPrice) error {
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := outboxcontext.Begin(ctx, r.db, nil)
 	if err != nil {
 		return err
 	}
@@ -261,12 +269,12 @@ func (r *repository) ReplaceAll(ctx context.Context, prices map[string]model.Mod
 		return err
 	}
 	defer stmt.Close()
-	tierStmt, err := prepareContextTierInsert(ctx, tx)
+	tierStmt, err := prepareContextTierInsert(ctx, tx.Tx)
 	if err != nil {
 		return err
 	}
 	defer tierStmt.Close()
-	serviceTierStmt, err := prepareServiceTierInsert(ctx, tx)
+	serviceTierStmt, err := prepareServiceTierInsert(ctx, tx.Tx)
 	if err != nil {
 		return err
 	}
@@ -308,7 +316,7 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 	if len(prices) == 0 {
 		return model.ModelPriceSyncResult{}, nil
 	}
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := outboxcontext.Begin(ctx, r.db, nil)
 	if err != nil {
 		return model.ModelPriceSyncResult{}, err
 	}
@@ -316,27 +324,7 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 		_ = tx.Rollback()
 	}()
 
-	stmt, err := tx.PrepareContext(ctx, `insert into model_prices (
-		model, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m,
-		prompt_configured, completion_configured, cache_read_configured, cache_creation_configured, source, source_model_id,
-		raw_json, updated_at_ms, synced_at_ms
-	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	on conflict(model) do update set
-		prompt_per_1m = excluded.prompt_per_1m,
-		completion_per_1m = excluded.completion_per_1m,
-		cache_per_1m = excluded.cache_per_1m,
-		cache_read_per_1m = excluded.cache_read_per_1m,
-		cache_creation_per_1m = excluded.cache_creation_per_1m,
-		prompt_configured = excluded.prompt_configured,
-		completion_configured = excluded.completion_configured,
-		cache_read_configured = excluded.cache_read_configured,
-		cache_creation_configured = excluded.cache_creation_configured,
-		source = excluded.source,
-		source_model_id = excluded.source_model_id,
-		raw_json = excluded.raw_json,
-		updated_at_ms = excluded.updated_at_ms,
-		synced_at_ms = excluded.synced_at_ms
-	where lower(trim(coalesce(model_prices.source, ''))) <> 'manual'`)
+	stmt, err := tx.PrepareContext(ctx, r.modelPriceUpsertSQL())
 	if err != nil {
 		return model.ModelPriceSyncResult{}, err
 	}
@@ -346,7 +334,7 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 		return model.ModelPriceSyncResult{}, err
 	}
 	defer deleteTierStmt.Close()
-	tierStmt, err := prepareContextTierInsert(ctx, tx)
+	tierStmt, err := prepareContextTierInsert(ctx, tx.Tx)
 	if err != nil {
 		return model.ModelPriceSyncResult{}, err
 	}
@@ -356,7 +344,7 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 		return model.ModelPriceSyncResult{}, err
 	}
 	defer deleteServiceTierStmt.Close()
-	serviceTierStmt, err := prepareServiceTierInsert(ctx, tx)
+	serviceTierStmt, err := prepareServiceTierInsert(ctx, tx.Tx)
 	if err != nil {
 		return model.ModelPriceSyncResult{}, err
 	}
@@ -435,6 +423,27 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 		return model.ModelPriceSyncResult{}, err
 	}
 	return result, nil
+}
+
+func (r *repository) modelPriceUpsertSQL() string {
+	upsertSQL := `insert into model_prices (
+		model, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m,
+		prompt_configured, completion_configured, cache_read_configured, cache_creation_configured, source, source_model_id,
+		raw_json, updated_at_ms, synced_at_ms
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` + r.dialect.UpsertClause(
+		[]string{"model"},
+		[]string{
+			"prompt_per_1m", "completion_per_1m", "cache_per_1m", "cache_read_per_1m",
+			"cache_creation_per_1m", "prompt_configured", "completion_configured",
+			"cache_read_configured", "cache_creation_configured", "source", "source_model_id",
+			"raw_json", "updated_at_ms", "synced_at_ms",
+		},
+	)
+	if r.dialect.IsMySQL() {
+		return upsertSQL + `, source = case when lower(trim(coalesce(model_prices.source, ''))) = 'manual'
+			then model_prices.source else VALUES(source) end`
+	}
+	return upsertSQL + ` where lower(trim(coalesce(model_prices.source, ''))) <> 'manual'`
 }
 
 func prepareContextTierInsert(ctx context.Context, tx *sql.Tx) (*sql.Stmt, error) {

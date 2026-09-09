@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -49,7 +50,8 @@ func TestRunRemovesOnlyLegacyConnectionFields(t *testing.T) {
 	if err := json.Unmarshal(fields["unknownObject"], &unknown); err != nil || unknown["enabled"] != true {
 		t.Fatalf("unknownObject=%v err=%v", unknown, err)
 	}
-	if info, err := os.Stat(outputPath); err != nil || info.Mode().Perm() != 0o640 {
+	if info, err := os.Stat(outputPath); err != nil ||
+		(runtime.GOOS != "windows" && info.Mode().Perm() != 0o640) {
 		t.Fatalf("output mode=%v err=%v", info.Mode().Perm(), err)
 	}
 }

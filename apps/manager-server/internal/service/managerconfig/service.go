@@ -33,6 +33,7 @@ type PublicManagerConfig struct {
 	Collector            store.ManagerCollectorConfig            `json:"collector"`
 	CodexInspection      store.ManagerCodexInspectionConfig      `json:"codexInspection"`
 	ExternalUsageService store.ManagerExternalUsageServiceConfig `json:"externalUsageService"`
+	CustomPages          []store.ManagerCustomPageConfig         `json:"customPages,omitempty"`
 	UpdatedAtMS          int64                                   `json:"updatedAtMs,omitempty"`
 }
 
@@ -115,6 +116,9 @@ func (s *Service) Update(ctx context.Context, submitted store.ManagerConfig) (Re
 		return Response{}, err
 	}
 	if err := model.ValidateCodexInspectionConfig(submitted.CodexInspection); err != nil {
+		return Response{}, err
+	}
+	if err := model.ValidateManagerCustomPages(submitted.CustomPages); err != nil {
 		return Response{}, err
 	}
 	next := s.MergeSubmittedManagerConfig(current, submitted)
@@ -328,6 +332,9 @@ func (s *Service) MergeSubmittedManagerConfig(base store.ManagerConfig, submitte
 	next.Collector.TLSSkipVerify = submitted.Collector.TLSSkipVerify
 
 	next.CodexInspection = store.NormalizeCodexInspectionConfig(submitted.CodexInspection, next.CodexInspection)
+	if submitted.CustomPages != nil {
+		next.CustomPages = model.NormalizeManagerCustomPages(submitted.CustomPages)
+	}
 
 	next.ExternalUsageService.Enabled = false
 	next.ExternalUsageService.ServiceBase = ""
@@ -344,6 +351,7 @@ func PublicConfig(cfg store.ManagerConfig) PublicManagerConfig {
 		Collector:            cfg.Collector,
 		CodexInspection:      cfg.CodexInspection,
 		ExternalUsageService: cfg.ExternalUsageService,
+		CustomPages:          cfg.CustomPages,
 		UpdatedAtMS:          cfg.UpdatedAtMS,
 	}
 }

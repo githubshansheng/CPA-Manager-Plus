@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
@@ -90,10 +91,11 @@ func (r *repository) LoadAccountStats(ctx context.Context, filter AnalyticsFilte
 	if !SupportsEventProjectionFilter(filter) {
 		return nil, State{}, false, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	projectionState, projectionAvailable, projectionComplete, err := projectionReadState(ctx, tx)
 	if err != nil || !projectionAvailable {
@@ -123,10 +125,11 @@ func (r *repository) LoadAPIKeyStats(ctx context.Context, filter AnalyticsFilter
 	if !SupportsEventProjectionFilter(filter) {
 		return nil, State{}, false, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	projectionState, projectionAvailable, projectionComplete, err := projectionReadState(ctx, tx)
 	if err != nil || !projectionAvailable {
@@ -152,7 +155,7 @@ func (r *repository) LoadAPIKeyStats(ctx context.Context, filter AnalyticsFilter
 	return sortedAPIKeyStats(grouped), projectionState, true, nil
 }
 
-func statsReadState(ctx context.Context, tx *sql.Tx) (State, string, bool, error) {
+func statsReadState(ctx context.Context, tx *dialect.Tx) (State, string, bool, error) {
 	state, err := stateQuery(ctx, tx, StatsRollupName)
 	if err != nil {
 		return State{}, "", false, err
@@ -172,7 +175,7 @@ func statsReadState(ctx context.Context, tx *sql.Tx) (State, string, bool, error
 
 func loadAccountRange(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	state State,
 	projectionCoverageEventID int64,
 	projectionComplete bool,
@@ -228,7 +231,7 @@ func loadAccountRange(
 
 func loadAPIKeyRange(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	state State,
 	projectionCoverageEventID int64,
 	projectionComplete bool,
@@ -269,7 +272,7 @@ func loadAPIKeyRange(
 
 func mergeStoredAccountStats(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	revision string,
 	filter AnalyticsFilter,
 	fromMS, toMS int64,
@@ -323,7 +326,7 @@ func mergeStoredAccountStats(
 
 func mergeProjectedAccountStats(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	projectionCoverageEventID int64,
 	projectionComplete bool,
 	filter AnalyticsFilter,
@@ -412,7 +415,7 @@ func mergeProjectedAccountStats(
 
 func mergeStoredAPIKeyStats(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	revision string,
 	filter AnalyticsFilter,
 	fromMS, toMS int64,
@@ -465,7 +468,7 @@ func mergeStoredAPIKeyStats(
 
 func mergeProjectedAPIKeyStats(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	projectionCoverageEventID int64,
 	projectionComplete bool,
 	filter AnalyticsFilter,

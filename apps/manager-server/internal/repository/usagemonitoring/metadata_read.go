@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageprojection"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
@@ -45,10 +46,11 @@ func (r *repository) LoadFilterOptions(ctx context.Context, filter AnalyticsFilt
 	if !SupportsEventProjectionFilter(filter) {
 		return FilterOptionValues{}, State{}, false, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return FilterOptionValues{}, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	state, available, projectionComplete, err := projectionReadState(ctx, tx)
 	if err != nil || !available {
@@ -128,10 +130,11 @@ func (r *repository) LoadFilterSelectors(ctx context.Context, filter AnalyticsFi
 	if !SupportsEventProjectionFilter(filter) {
 		return FilterSelectorValues{}, State{}, false, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return FilterSelectorValues{}, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	projectionState, projectionAvailable, projectionComplete, err := projectionReadState(ctx, tx)
 	if err != nil || !projectionAvailable {
@@ -180,7 +183,7 @@ func (r *repository) LoadFilterSelectors(ctx context.Context, filter AnalyticsFi
 
 func mergeStoredSelectorRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	fromMS, toMS int64,
 	grouped map[selectorKey]*selectorRow,
 ) error {
@@ -200,7 +203,7 @@ func mergeStoredSelectorRows(
 
 func mergeProjectedSelectorRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	projectionCoverageEventID int64,
 	projectionComplete bool,
 	filter AnalyticsFilter,
@@ -387,10 +390,11 @@ func (r *repository) LoadHeaderSnapshots(ctx context.Context, sinceMS int64, lim
 	if limit <= 0 {
 		return []HeaderSnapshot{}, State{}, true, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	state, err := stateQuery(ctx, tx, MetadataRollupName)
 	if err != nil {
@@ -413,23 +417,25 @@ func (r *repository) LoadHeaderSnapshots(ctx context.Context, sinceMS int64, lim
 	return sortedHeaderSnapshots(grouped, limit), state, true, nil
 }
 
-func mergeStoredHeaderRows(ctx context.Context, tx *sql.Tx, sinceMS int64, limit int, grouped map[string]headerRow) error {
-	rows, err := tx.QueryContext(ctx, `select
-		stored.snapshot_key, stored.event_id, stored.event_hash, stored.timestamp_ms,
+var storedHeaderRowsSQL = `select
+		header_latest.snapshot_key, header_latest.event_id, header_latest.event_hash, header_latest.timestamp_ms,
 		coalesce(usage_event.model, ''),
-		`+usageidentity.SQLRequestAnalyticsModelExpression("usage_event.model", "usage_event.requested_model")+`,
+		` + usageidentity.SQLRequestAnalyticsModelExpression("usage_event.model", "usage_event.requested_model") + `,
 		coalesce(usage_event.requested_model, ''), coalesce(usage_event.resolved_model, ''),
-		stored.auth_file_snapshot,
-		stored.auth_index, stored.account_snapshot, stored.auth_label_snapshot,
-		stored.auth_provider_snapshot, stored.auth_account_id_snapshot, stored.auth_project_id_snapshot, stored.source, stored.source_hash,
-		stored.response_metadata_json, stored.header_quota_recover_at_ms,
-		stored.header_quota_used_percent, stored.header_quota_plan_type, stored.header_error_kind,
-		stored.header_error_code, stored.header_trace_id
-	from usage_monitoring_header_latest_v1 stored
-	left join usage_events usage_event on usage_event.id = stored.event_id
-	where stored.timestamp_ms >= ?
-	order by stored.timestamp_ms desc, stored.event_id desc
-	limit ?`, sinceMS, limit)
+		header_latest.auth_file_snapshot,
+		header_latest.auth_index, header_latest.account_snapshot, header_latest.auth_label_snapshot,
+		header_latest.auth_provider_snapshot, header_latest.auth_account_id_snapshot, header_latest.auth_project_id_snapshot, header_latest.source, header_latest.source_hash,
+		header_latest.response_metadata_json, header_latest.header_quota_recover_at_ms,
+		header_latest.header_quota_used_percent, header_latest.header_quota_plan_type, header_latest.header_error_kind,
+		header_latest.header_error_code, header_latest.header_trace_id
+	from usage_monitoring_header_latest_v1 header_latest
+	left join usage_events usage_event on usage_event.id = header_latest.event_id
+	where header_latest.timestamp_ms >= ?
+	order by header_latest.timestamp_ms desc, header_latest.event_id desc
+	limit ?`
+
+func mergeStoredHeaderRows(ctx context.Context, tx *dialect.Tx, sinceMS int64, limit int, grouped map[string]headerRow) error {
+	rows, err := tx.QueryContext(ctx, storedHeaderRowsSQL, sinceMS, limit)
 	if err != nil {
 		return err
 	}
@@ -437,8 +443,7 @@ func mergeStoredHeaderRows(ctx context.Context, tx *sql.Tx, sinceMS int64, limit
 	return scanHeaderRows(rows, grouped)
 }
 
-func mergeRawHeaderRows(ctx context.Context, tx *sql.Tx, sinceMS, afterID int64, limit int, grouped map[string]headerRow) error {
-	query := fmt.Sprintf(`with candidates as (
+var rawHeaderRowsSQL = fmt.Sprintf(`with candidates as (
 		select
 			id,
 			event_hash,
@@ -482,8 +487,9 @@ func mergeRawHeaderRows(ctx context.Context, tx *sql.Tx, sinceMS, afterID int64,
 			or coalesce(source_hash, '') <> ''
 		)
 	), ranked as (
-		select *, row_number() over (
-			partition by snapshot_key order by timestamp_ms desc, id desc
+		select candidates.*, row_number() over (
+			partition by candidates.snapshot_key
+			order by candidates.timestamp_ms desc, candidates.id desc
 		) as rn
 		from candidates
 	)
@@ -499,7 +505,9 @@ func mergeRawHeaderRows(ctx context.Context, tx *sql.Tx, sinceMS, afterID int64,
 	from ranked where rn = 1
 	order by timestamp_ms desc, id desc
 		limit ?`, usageprojection.SnapshotKeyExpression(""))
-	rows, err := tx.QueryContext(ctx, query, afterID, sinceMS, limit)
+
+func mergeRawHeaderRows(ctx context.Context, tx *dialect.Tx, sinceMS, afterID int64, limit int, grouped map[string]headerRow) error {
+	rows, err := tx.QueryContext(ctx, rawHeaderRowsSQL, afterID, sinceMS, limit)
 	if err != nil {
 		return err
 	}

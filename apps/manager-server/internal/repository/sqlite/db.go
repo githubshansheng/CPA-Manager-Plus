@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -32,9 +34,28 @@ func OpenWithOptions(options Options) (*sql.DB, error) {
 	db.SetMaxOpenConns(options.maxOpenConns())
 	db.SetMaxIdleConns(options.maxIdleConns())
 	db.SetConnMaxIdleTime(options.connMaxIdleTime())
+	ctx := context.Background()
+	if err := outboxcontext.Prepare(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	journalSuspended, err := outboxcontext.SuspendForSchemaMigration(ctx, db)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := Migrate(db); err != nil {
 		_ = db.Close()
 		return nil, enrichOpenError(dbPath, err)
+	}
+	if journalSuspended {
+		err = outboxcontext.ResumeAfterSchemaMigration(ctx, db)
+	} else {
+		err = outboxcontext.Ensure(ctx, db)
+	}
+	if err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return db, nil
 }

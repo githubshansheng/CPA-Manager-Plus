@@ -4,6 +4,7 @@ import {
   normalizeUsageServiceBase,
   usageServiceApi,
   type ManagerConfig,
+  type ManagerCustomPageConfig,
 } from '@/services/api/usageService';
 import { DEMO_API_BASE, isDemoMode } from '@/features/demo/demoMode';
 import { useAuthStore } from '@/stores';
@@ -30,6 +31,7 @@ export interface PanelFeatureAvailability {
   serverCodexInspectionAvailable: boolean;
   dockerSetupAvailable: boolean;
   externalManagerConfigAvailable: boolean;
+  customPages: ManagerCustomPageConfig[];
   reason: PanelFeatureUnavailableReason | '';
 }
 
@@ -61,6 +63,7 @@ const buildUnavailableState = (
   serverCodexInspectionAvailable: false,
   dockerSetupAvailable: input.panelHostedByUsageService,
   externalManagerConfigAvailable: false,
+  customPages: [],
   reason,
 });
 
@@ -105,6 +108,7 @@ export function resolvePanelFeatureAvailability(
     serverCodexInspectionAvailable: hasCPAConnection,
     dockerSetupAvailable: input.panelHostedByUsageService,
     externalManagerConfigAvailable: false,
+    customPages: input.managerConfig.customPages ?? [],
     reason: requestMonitoringAvailable
       ? ''
       : !hasCPAConnection
@@ -166,6 +170,7 @@ const initialAvailability: PanelFeatureAvailability = {
   serverCodexInspectionAvailable: false,
   dockerSetupAvailable: false,
   externalManagerConfigAvailable: false,
+  customPages: [],
   reason: 'checking',
 };
 
@@ -181,6 +186,7 @@ const demoAvailability: PanelFeatureAvailability = {
   serverCodexInspectionAvailable: true,
   dockerSetupAvailable: true,
   externalManagerConfigAvailable: false,
+  customPages: [],
   reason: '',
 };
 
@@ -316,6 +322,7 @@ export function usePanelFeatureAvailability(): PanelFeatureAvailability {
   const demoMode = __DEMO_SITE__ && isDemoMode();
   const apiBase = useAuthStore((state) => state.apiBase);
   const managementKey = useAuthStore((state) => state.managementKey);
+  const recoveryMode = useAuthStore((state) => state.recoveryMode);
   const usageServiceRevision = useUsageServiceStore((state) => state.revision);
   const panelBase = useMemo(() => detectApiBaseFromLocation(), []);
   const requestInput = useMemo(
@@ -342,7 +349,7 @@ export function usePanelFeatureAvailability(): PanelFeatureAvailability {
 
   useEffect(() => {
     let cancelled = false;
-    if (demoMode) {
+    if (demoMode || recoveryMode === 'database_recovery') {
       return () => {
         cancelled = true;
       };
@@ -357,9 +364,26 @@ export function usePanelFeatureAvailability(): PanelFeatureAvailability {
     return () => {
       cancelled = true;
     };
-  }, [panelBase, demoMode, requestInput, requestKey]);
+  }, [panelBase, demoMode, recoveryMode, requestInput, requestKey]);
 
   if (demoMode) return demoAvailability;
+  if (recoveryMode === 'database_recovery') {
+    return {
+      checking: false,
+      panelHostConfirmed: true,
+      panelHostMode: 'manager_embedded',
+      panelBase: normalizeBase(panelBase),
+      managerServiceBase: normalizeBase(apiBase || panelBase),
+      managerServiceAvailable: true,
+      requestMonitoringAvailable: false,
+      modelPricesAvailable: false,
+      serverCodexInspectionAvailable: false,
+      dockerSetupAvailable: true,
+      externalManagerConfigAvailable: false,
+      customPages: [],
+      reason: 'service_unavailable',
+    };
+  }
   if (state.requestKey === requestKey) return state.availability;
 
   return {

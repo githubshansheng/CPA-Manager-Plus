@@ -381,7 +381,7 @@ func (w *RateLimitAutoDisableWorker) handleCandidateLocked(ctx context.Context, 
 }
 
 func (w *RateLimitAutoDisableWorker) extendExistingCooldown(ctx context.Context, candidate quotaAutoDisableCandidate, current authFile) bool {
-	active, err := w.store.QuotaCooldowns.ListActive(ctx)
+	active, err := w.store.ListActiveQuotaCooldowns(ctx)
 	if err != nil {
 		log.Printf("[quota-auto-disable] failed to check active cooldowns for auth file %q: %v", candidate.FileName, err)
 		return false

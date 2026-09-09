@@ -26,6 +26,7 @@ import { ModelPricesPage } from '@/pages/ModelPricesPage';
 import { ConfigPage } from '@/pages/ConfigPage';
 import { LogsPage } from '@/pages/LogsPage';
 import { PluginResourcePage } from '@/pages/PluginResourcePage';
+import { CustomPage } from '@/pages/CustomPage';
 import { PluginsPage } from '@/pages/PluginsPage';
 import { SystemPage } from '@/pages/SystemPage';
 import { ManagerUpdatePage } from '@/pages/ManagerUpdatePage';
@@ -34,7 +35,7 @@ import { usePanelFeatureAvailability } from '@/hooks/usePanelFeatureAvailability
 import { ensureRouteBasePathname, isDemoMode } from '@/features/demo/demoMode';
 import { useAuthStore, useConfigStore } from '@/stores';
 
-type FeatureKey = 'requestMonitoring' | 'modelPrices';
+type FeatureKey = 'managerMonitoringPages' | 'requestMonitoring' | 'modelPrices';
 
 function LegacyAccountsRedirect({ healthMode }: { healthMode: 'local' | 'server' }) {
   const location = useLocation();
@@ -67,9 +68,11 @@ function FeatureGate({
 }) {
   const availability = usePanelFeatureAvailability();
   const enabled =
-    feature === 'requestMonitoring'
-      ? availability.requestMonitoringAvailable
-      : availability.modelPricesAvailable;
+    feature === 'managerMonitoringPages'
+      ? availability.managerServiceAvailable
+      : feature === 'requestMonitoring'
+        ? availability.requestMonitoringAvailable
+        : availability.modelPricesAvailable;
 
   if (availability.checking) {
     return fallback ?? <LoadingSpinner />;
@@ -151,7 +154,7 @@ const mainRoutes: RouteObject[] = [
   {
     path: '/usage-analytics',
     element: (
-      <FeatureGate feature="requestMonitoring">
+      <FeatureGate feature="managerMonitoringPages">
         <UsageAnalyticsPage />
       </FeatureGate>
     ),
@@ -175,7 +178,7 @@ const mainRoutes: RouteObject[] = [
   {
     path: '/monitoring',
     element: (
-      <FeatureGate feature="requestMonitoring">
+      <FeatureGate feature="managerMonitoringPages">
         <MonitoringCenterPage />
       </FeatureGate>
     ),
@@ -231,6 +234,15 @@ const mainRoutes: RouteObject[] = [
   { path: '/plugins/*', element: <Navigate to="/plugins" replace /> },
   { path: '/plugin-store/*', element: <Navigate to="/plugins?tab=store" replace /> },
   { path: '/plugin-pages/*', element: <Navigate to="/" replace /> },
+  {
+    path: '/custom-pages/:pageId',
+    element: (
+      <FeatureGate feature="managerMonitoringPages">
+        <CustomPage />
+      </FeatureGate>
+    ),
+  },
+  { path: '/custom-pages/*', element: <Navigate to="/config" replace /> },
   { path: '/config', element: <ConfigPage /> },
   {
     path: '/logs',

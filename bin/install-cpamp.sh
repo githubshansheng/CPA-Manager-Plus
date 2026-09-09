@@ -312,6 +312,8 @@ text() {
     en-US:auth_repair_prompt) printf 'Stop CPAMP and repair the admin login automatically? Enter yes/no' ;;
     zh-CN:health_failed) printf 'CPAMP 容器未能在规定时间内通过健康检查。' ;;
     en-US:health_failed) printf 'The CPAMP container did not become healthy in time.' ;;
+    zh-CN:readiness_failed) printf 'CPAMP 进程已启动，但正常业务数据接口未就绪或服务已进入数据库恢复模式；本次部署不会提交。' ;;
+    en-US:readiness_failed) printf 'CPAMP started, but the normal business-data API is unavailable or the service entered database recovery mode; this deployment will not be committed.' ;;
     zh-CN:key_saved) printf '管理员密钥已保存' ;;
     en-US:key_saved) printf 'Admin key saved' ;;
     zh-CN:key_view_command) printf '查看管理员密钥' ;;
@@ -3153,6 +3155,7 @@ print_docker_post_import_validation_commands() {
   local key_file="${cpa_management_key_file:-$install_dir/secrets/cpa-management-key}"
   say "cd \"$install_dir\" && docker compose exec -T cpa-manager-plus wget -qO- http://127.0.0.1:18317/health"
   say "cd \"$install_dir\" && CPAMP_ADMIN_KEY=\"\$(< \"$install_dir/secrets/cpamp-admin-key\")\" && docker compose exec -T cpa-manager-plus wget -qO- --header=\"Authorization: Bearer \$CPAMP_ADMIN_KEY\" http://127.0.0.1:18317/status"
+  say "cd \"$install_dir\" && CPAMP_ADMIN_KEY=\"\$(< \"$install_dir/secrets/cpamp-admin-key\")\" && docker compose exec -T cpa-manager-plus wget -qO- --header=\"Authorization: Bearer \$CPAMP_ADMIN_KEY\" http://127.0.0.1:18317/usage-service/config"
   say "cd \"$install_dir\" && CPAMP_ADMIN_KEY=\"\$(< \"$install_dir/secrets/cpamp-admin-key\")\" && docker compose exec -T cpa-manager-plus wget -qO- --post-data='' --header=\"Authorization: Bearer \$CPAMP_ADMIN_KEY\" http://127.0.0.1:18317/v0/management/cpa-connection/validate"
   if [ "$cpa_management_key_cleanup_allowed" = "1" ] && [ -n "$key_file" ]; then
     say "rm -f \"$key_file\""
@@ -3674,6 +3677,29 @@ verify_docker_admin_key() {
   )
 }
 
+verify_docker_service_readiness() {
+  local status=""
+  [ -n "$admin_key" ] || return 1
+  if ! status="$(
+    cd "$install_dir"
+    docker compose exec -T cpa-manager-plus wget -qO- \
+      --header="Authorization: Bearer $admin_key" \
+      http://127.0.0.1:18317/status 2>/dev/null
+  )"; then
+    return 1
+  fi
+  [ -n "$status" ] || return 1
+  if printf '%s\n' "$status" | grep -Eq '"recoveryMode"[[:space:]]*:[[:space:]]*true'; then
+    return 1
+  fi
+  (
+    cd "$install_dir"
+    docker compose exec -T cpa-manager-plus wget -qO- \
+      --header="Authorization: Bearer $admin_key" \
+      http://127.0.0.1:18317/usage-service/config >/dev/null 2>&1
+  )
+}
+
 verify_docker_cpa_connection() {
   if [ "$cpa_connection_imported" != "1" ] && [ "$installer_managed_cpa_key_pending_cleanup" != "1" ] &&
      [ -z "$installer_managed_cpa_key_pending_import_copies" ]; then
@@ -3718,6 +3744,9 @@ validate_docker_install() {
       die "$(text repair_verify_failed)"
     fi
     auth_validation_status="verified"
+  fi
+  if ! verify_docker_service_readiness; then
+    die "$(text readiness_failed) Run 'cd \"$install_dir\" && docker compose logs cpa-manager-plus' for details."
   fi
   if ! verify_docker_cpa_connection; then
     die "$(text cpa_validation_failed)"
@@ -4018,6 +4047,7 @@ print_native_connection_import_command() {
 print_native_post_import_validation_commands() {
   say "curl -fsS \"http://127.0.0.1:${cpamp_port}/health\""
   say "CPAMP_ADMIN_KEY=\"\$(< \"$install_dir/secrets/cpamp-admin-key\")\" && curl -fsS -H \"Authorization: Bearer \$CPAMP_ADMIN_KEY\" \"http://127.0.0.1:${cpamp_port}/status\""
+  say "CPAMP_ADMIN_KEY=\"\$(< \"$install_dir/secrets/cpamp-admin-key\")\" && curl -fsS -H \"Authorization: Bearer \$CPAMP_ADMIN_KEY\" \"http://127.0.0.1:${cpamp_port}/usage-service/config\""
   say "CPAMP_ADMIN_KEY=\"\$(< \"$install_dir/secrets/cpamp-admin-key\")\" && curl -fsS -X POST -H \"Authorization: Bearer \$CPAMP_ADMIN_KEY\" \"http://127.0.0.1:${cpamp_port}/v0/management/cpa-connection/validate\""
   if [ "$cpa_management_key_cleanup_allowed" = "1" ] && [ -n "$cpa_management_key_file" ]; then
     say "rm -f \"$cpa_management_key_file\""
@@ -4493,6 +4523,23 @@ verify_native_admin_key() {
     "http://127.0.0.1:${cpamp_port}/status" >/dev/null 2>&1
 }
 
+verify_native_service_readiness() {
+  local status=""
+  [ -n "$admin_key" ] || return 1
+  if ! status="$(curl -fsS \
+    -H "Authorization: Bearer $admin_key" \
+    "http://127.0.0.1:${cpamp_port}/status" 2>/dev/null)"; then
+    return 1
+  fi
+  [ -n "$status" ] || return 1
+  if printf '%s\n' "$status" | grep -Eq '"recoveryMode"[[:space:]]*:[[:space:]]*true'; then
+    return 1
+  fi
+  curl -fsS \
+    -H "Authorization: Bearer $admin_key" \
+    "http://127.0.0.1:${cpamp_port}/usage-service/config" >/dev/null 2>&1
+}
+
 verify_native_cpa_connection() {
   if [ "$cpa_connection_imported" != "1" ] && [ "$installer_managed_cpa_key_pending_cleanup" != "1" ] &&
      [ -z "$installer_managed_cpa_key_pending_import_copies" ]; then
@@ -4539,6 +4586,9 @@ run_native_install() {
     die "$(text auth_failed)"
   fi
   auth_validation_status="verified"
+  if ! verify_native_service_readiness; then
+    die "$(text readiness_failed) Check the log file: $log_file"
+  fi
   if ! verify_native_cpa_connection; then
     die "$(text cpa_validation_failed)"
   fi

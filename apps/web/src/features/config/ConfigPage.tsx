@@ -45,7 +45,16 @@ import {
   type CPAUsageConfig,
   type ManagerConfig,
   type ManagerConfigResponse,
+  type ManagerCustomPageConfig,
 } from '@/services/api/usageService';
+import {
+  MANAGER_CUSTOM_PAGE_MAX_COUNT,
+  MANAGER_CUSTOM_PAGE_MAX_TITLE_LENGTH,
+  MANAGER_CUSTOM_PAGE_MAX_URL_LENGTH,
+  managerCustomPagesEqual,
+  normalizeManagerCustomPages,
+  validateManagerCustomPages,
+} from '@/features/custom-pages/customPages';
 import { detectApiBaseFromLocation } from '@/utils/connection';
 import { ManagerConfigPanel } from './components/ManagerConfigPanel';
 import styles from './ConfigPage.module.scss';
@@ -183,6 +192,7 @@ export function resolveManagerFormDirty({
   pollIntervalMs,
   batchSize,
   queryLimit,
+  customPages,
 }: {
   managerConfig: ManagerConfig | null;
   cpaBaseUrlInput: string;
@@ -192,6 +202,7 @@ export function resolveManagerFormDirty({
   pollIntervalMs: string;
   batchSize: string;
   queryLimit: string;
+  customPages?: readonly ManagerCustomPageConfig[];
 }): boolean {
   if (!managerConfig) return false;
 
@@ -205,6 +216,7 @@ export function resolveManagerFormDirty({
   if (nextManagementKey) return true;
 
   if (requestMonitoringEnabled !== (savedCollector.enabled !== false)) return true;
+  if (customPages && !managerCustomPagesEqual(customPages, managerConfig.customPages)) return true;
   const savedCollectorMode =
     savedCollector.collectorMode || MANAGER_COLLECTOR_DEFAULT.collectorMode;
   if ((collectorMode || MANAGER_COLLECTOR_DEFAULT.collectorMode) !== savedCollectorMode) {
@@ -398,6 +410,7 @@ export function ConfigPage() {
   const [managerQueryLimit, setManagerQueryLimit] = useState(
     String(MANAGER_COLLECTOR_DEFAULT.queryLimit)
   );
+  const [managerCustomPages, setManagerCustomPages] = useState<ManagerCustomPageConfig[]>([]);
 
   // Search state
   const [searchQuery, setSearchQuery] = useState('');
@@ -484,9 +497,11 @@ export function ConfigPage() {
       updateSourceSnapshotStale(false);
       setSourceConfigLoaded(true);
       loadVisualValuesFromYaml(data);
+      return true;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('notification.refresh_failed');
       setError(message);
+      return false;
     } finally {
       setLoading(false);
     }
@@ -546,6 +561,7 @@ export function ConfigPage() {
         pollIntervalMs: managerPollIntervalMs,
         batchSize: managerBatchSize,
         queryLimit: managerQueryLimit,
+        customPages: managerCustomPages,
       }),
     [
       managerBatchSize,
@@ -553,6 +569,7 @@ export function ConfigPage() {
       managerCPAManagementKeyInput,
       managerCollectorMode,
       managerConfig,
+      managerCustomPages,
       managerPollIntervalMs,
       managerQueryLimit,
       managerRequestMonitoringEnabled,
@@ -763,8 +780,10 @@ export function ConfigPage() {
 
   const applyManagerConfigResponse = useCallback((response: ManagerConfigResponse) => {
     const receivedConnection = response.config.cpaConnection;
+    const customPages = normalizeManagerCustomPages(response.config.customPages);
     const nextConfig: ManagerConfig = {
       ...response.config,
+      customPages,
       cpaConnection: {
         cpaBaseUrl: receivedConnection?.cpaBaseUrl || '',
         managementKeyConfigured: Boolean(
@@ -785,6 +804,7 @@ export function ConfigPage() {
     );
     setManagerBatchSize(String(collector.batchSize || MANAGER_COLLECTOR_DEFAULT.batchSize));
     setManagerQueryLimit(String(collector.queryLimit || MANAGER_COLLECTOR_DEFAULT.queryLimit));
+    setManagerCustomPages(customPages);
     setManagerCPAManagementKeyInput('');
     setManagerCPAManagementKeyVisible(false);
   }, []);
@@ -801,6 +821,7 @@ export function ConfigPage() {
       setManagerCPAUsage(null);
       setManagerConfigSource('');
       setManagerCPABaseInput('');
+      setManagerCustomPages([]);
       return;
     }
     if (!requestAuthKey) {
@@ -974,9 +995,8 @@ export function ConfigPage() {
           panelHostMode: 'manager_embedded',
         }
       );
-      showNotification(t('config_management.manager.save_success'), 'success');
     },
-    [applyManagerConfigResponse, detectedPanelBase, setUsageServiceConfig, showNotification, t]
+    [applyManagerConfigResponse, detectedPanelBase, setUsageServiceConfig]
   );
 
   const handleManagerSave = async () => {
@@ -997,18 +1017,42 @@ export function ConfigPage() {
       return;
     }
     try {
+      const customPageValidation = validateManagerCustomPages(managerCustomPages);
+      if (customPageValidation) {
+        showNotification(
+          t(`config_management.manager.custom_menu_validation_${customPageValidation.code}`, {
+            index: (customPageValidation.index ?? 0) + 1,
+            maxCount: MANAGER_CUSTOM_PAGE_MAX_COUNT,
+            maxTitleLength: MANAGER_CUSTOM_PAGE_MAX_TITLE_LENGTH,
+            maxUrlLength: MANAGER_CUSTOM_PAGE_MAX_URL_LENGTH,
+          }),
+          'error'
+        );
+        return;
+      }
+      const normalizedCustomPages = normalizeManagerCustomPages(managerCustomPages);
+      const savedCollector = managerConfig?.collector ?? MANAGER_COLLECTOR_DEFAULT;
       const pollIntervalMs = managerRequestMonitoringEnabled
         ? readManagerPositiveInteger(
             managerPollIntervalMs,
             t('config_management.manager.poll_interval_ms')
           )
-        : MANAGER_COLLECTOR_DEFAULT.pollIntervalMs;
+        : resolveManagerPositiveIntegerBaseline(
+            savedCollector.pollIntervalMs,
+            MANAGER_COLLECTOR_DEFAULT.pollIntervalMs
+          );
       const batchSize = managerRequestMonitoringEnabled
         ? readManagerPositiveInteger(managerBatchSize, t('config_management.manager.batch_size'))
-        : MANAGER_COLLECTOR_DEFAULT.batchSize;
+        : resolveManagerPositiveIntegerBaseline(
+            savedCollector.batchSize,
+            MANAGER_COLLECTOR_DEFAULT.batchSize
+          );
       const queryLimit = managerRequestMonitoringEnabled
         ? readManagerPositiveInteger(managerQueryLimit, t('config_management.manager.query_limit'))
-        : MANAGER_COLLECTOR_DEFAULT.queryLimit;
+        : resolveManagerPositiveIntegerBaseline(
+            savedCollector.queryLimit,
+            MANAGER_COLLECTOR_DEFAULT.queryLimit
+          );
       if (managerRequestMonitoringEnabled && pollIntervalMs > managerRetentionSeconds * 1000) {
         showNotification(t('config_management.manager.poll_interval_retention_error'), 'error');
         return;
@@ -1041,6 +1085,7 @@ export function ConfigPage() {
           enabled: false,
           serviceBase: '',
         },
+        customPages: normalizedCustomPages,
       };
       const savedCPABase = normalizeUsageServiceBase(
         managerConfig?.cpaConnection?.cpaBaseUrl || ''
@@ -1059,28 +1104,23 @@ export function ConfigPage() {
         if (managerSavingRef.current || apiKeyMutationInFlightRef.current) return;
         managerSavingRef.current = true;
         setManagerSaving(true);
-        let requestStarted = false;
         try {
-          requestStarted = true;
           await saveManagerConfigPayload(serviceBase, nextConfig, requestAuthKey);
           if (cpaBaseChanged) {
-            window.location.reload();
-          }
-        } catch (error: unknown) {
-          if (cpaBaseChanged && requestStarted) {
-            if (notifyOnError) {
-              const message = getUsageServiceDisplayError(
-                error,
-                'usage_service_errors.request_failed'
-              );
-              showNotification(
-                `${t('notification.save_failed')}${message ? `: ${message}` : ''}`,
-                'error'
-              );
+            const localConfigRefreshed = await loadConfig();
+            let globalConfigRefreshed = true;
+            try {
+              useConfigStore.getState().clearCache();
+              await useConfigStore.getState().fetchConfig(undefined, true);
+            } catch {
+              globalConfigRefreshed = false;
             }
-            window.location.reload();
-            return;
+            if (!localConfigRefreshed || !globalConfigRefreshed) {
+              showNotification(t('notification.refresh_failed'), 'warning');
+            }
           }
+          showNotification(t('config_management.manager.save_success'), 'success');
+        } catch (error: unknown) {
           if (notifyOnError) {
             const message = getUsageServiceDisplayError(
               error,
@@ -1671,6 +1711,7 @@ export function ConfigPage() {
               managerRetentionSeconds={managerRetentionSeconds}
               managerConfigSourceLabel={managerConfigSourceLabel}
               managerUsageStatisticsEnabled={Boolean(managerCPAUsage?.usageStatisticsEnabled)}
+              managerCustomPages={managerCustomPages}
               onRefresh={() => void loadManagerConfig()}
               onRequestMonitoringChange={(value) => {
                 setManagerRequestMonitoringEnabled(value);
@@ -1700,6 +1741,7 @@ export function ConfigPage() {
               onQueryLimitChange={(value) => {
                 setManagerQueryLimit(value);
               }}
+              onManagerCustomPagesChange={setManagerCustomPages}
             />
           ) : activeTab === 'visual' ? (
             <VisualConfigEditor

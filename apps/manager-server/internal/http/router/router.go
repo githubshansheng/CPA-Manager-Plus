@@ -10,6 +10,7 @@ import (
 	automationcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/automation"
 	codexinspectioncontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/codexinspection"
 	dashboardcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/dashboard"
+	databasemanagementcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/databasemanagement"
 	healthcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/health"
 	managerconfigcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/managerconfig"
 	modelpricecontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/modelprice"
@@ -39,6 +40,7 @@ func New(appCtx *app.Context) http.Handler {
 	quotaCooldownHandler := &quotacooldowncontroller.Handler{App: appCtx}
 	codexInspectionHandler := &codexinspectioncontroller.Handler{App: appCtx}
 	dashboardHandler := &dashboardcontroller.Handler{App: appCtx}
+	databaseManagementHandler := &databasemanagementcontroller.Handler{App: appCtx}
 	monitoringHandler := &monitoringcontroller.Handler{App: appCtx}
 	quotaSnapshotHandler := &quotasnapshotcontroller.Handler{App: appCtx}
 	proxyHandler := &proxycontroller.Handler{App: appCtx}
@@ -54,11 +56,15 @@ func New(appCtx *app.Context) http.Handler {
 	mux.HandleFunc("/usage-service/config", middleware.WithCORS(appCtx.Config, managerConfigHandler.Handle))
 	mux.HandleFunc("/usage-service/account-processing-policy", middleware.WithCORS(appCtx.Config, automationHandler.Handle))
 	mux.HandleFunc("/usage-service/quota-cooldowns", middleware.WithCORS(appCtx.Config, quotaCooldownHandler.Handle))
+	mux.HandleFunc("/v0/management/system/restart", middleware.WithCORS(appCtx.Config, systemHandler.Restart))
 	mux.HandleFunc("/setup", middleware.WithCORS(appCtx.Config, setupHandler.Setup))
+	mux.HandleFunc("/setup/sqlite-source/preflight", middleware.WithCORS(appCtx.Config, setupHandler.PreflightSQLiteAdoption))
+	mux.HandleFunc("/setup/sqlite-source/adopt", middleware.WithCORS(appCtx.Config, setupHandler.AdoptSQLite))
 	mux.HandleFunc("/management.html", panelHandler.ManagementHTML)
-	mux.HandleFunc("/", rootHandler(appCtx, usageHandler, modelPriceHandler, apiKeyAliasHandler, accountActionHandler, codexInspectionHandler, dashboardHandler, monitoringHandler, quotaSnapshotHandler, managerConfigHandler, proxyHandler))
+	mux.HandleFunc("/", rootHandler(appCtx, usageHandler, modelPriceHandler, apiKeyAliasHandler, accountActionHandler, codexInspectionHandler, dashboardHandler, databaseManagementHandler, monitoringHandler, quotaSnapshotHandler, managerConfigHandler, proxyHandler))
 
-	return middleware.Recovery(middleware.RequestLogger(mux))
+	withCoverage := middleware.WithDatabaseCoverage(mux)
+	return middleware.Recovery(middleware.RequestLogger(withCoverage))
 }
 
 func rootHandler(
@@ -69,6 +75,7 @@ func rootHandler(
 	accountActionHandler *accountactioncontroller.Handler,
 	codexInspectionHandler *codexinspectioncontroller.Handler,
 	dashboardHandler *dashboardcontroller.Handler,
+	databaseManagementHandler *databasemanagementcontroller.Handler,
 	monitoringHandler *monitoringcontroller.Handler,
 	quotaSnapshotHandler *quotasnapshotcontroller.Handler,
 	managerConfigHandler *managerconfigcontroller.Handler,
@@ -98,6 +105,10 @@ func rootHandler(
 		}
 		if strings.HasPrefix(r.URL.Path, "/v0/management/dashboard/") {
 			middleware.WithCORS(appCtx.Config, dashboardHandler.Handle)(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v0/management/databases/") {
+			middleware.WithCORS(appCtx.Config, databaseManagementHandler.Handle)(w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/v0/management/monitoring/") {

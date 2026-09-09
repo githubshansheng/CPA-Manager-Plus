@@ -28,6 +28,7 @@ import { getObfuscationVersion } from '@/utils/encryption';
 interface AuthStoreState extends AuthState {
   sessionMode: AuthSessionMode | '';
   sessionPanelBase: string;
+  recoveryMode: LoginResult['recoveryMode'] | '';
   connectionStatus: ConnectionStatus;
   connectionError: string | null;
 
@@ -164,6 +165,7 @@ export const useAuthStore = create<AuthStoreState>()(
       supportsPlugin: false,
       sessionMode: '',
       sessionPanelBase: '',
+      recoveryMode: '',
       connectionStatus: 'disconnected',
       connectionError: null,
 
@@ -348,6 +350,8 @@ export const useAuthStore = create<AuthStoreState>()(
 
           onAccepted?.();
 
+          const resolvedSessionMode =
+            result.recoveryMode === 'database_recovery' ? 'manager_embedded' : sessionMode;
           useQuotaStore.getState().activateQuotaCacheScope(quotaCacheScope);
           apiClient.setConfig({ apiBase, managementKey });
           set({
@@ -355,8 +359,9 @@ export const useAuthStore = create<AuthStoreState>()(
             apiBase,
             managementKey,
             rememberPassword,
-            sessionMode,
+            sessionMode: resolvedSessionMode,
             sessionPanelBase,
+            recoveryMode: result.recoveryMode ?? '',
             connectionStatus: 'connected',
             connectionError: null,
           });
@@ -388,6 +393,25 @@ export const useAuthStore = create<AuthStoreState>()(
           try {
             await useConfigStore.getState().fetchConfig(undefined, true);
           } catch (error) {
+            try {
+              const status = await usageServiceApi.getStatus(apiBase, managementKey);
+              if (status.recoveryMode === true) {
+                useConfigStore.getState().clearCache();
+                useUsageServiceStore.getState().setUsageServiceConfig(
+                  {
+                    enabled: true,
+                    serviceBase: apiBase,
+                  },
+                  {
+                    panelBase: sessionPanelBase || apiBase,
+                    panelHostMode: 'manager_embedded',
+                  }
+                );
+                return markAuthenticated({ recoveryMode: 'database_recovery' });
+              }
+            } catch {
+              // A normal CPA panel may not expose the Manager Server status contract.
+            }
             if (sessionMode !== 'manager_embedded') {
               throw error;
             }
@@ -450,6 +474,7 @@ export const useAuthStore = create<AuthStoreState>()(
           supportsPlugin: false,
           sessionMode: '',
           sessionPanelBase: '',
+          recoveryMode: '',
           connectionStatus: 'disconnected',
           connectionError: null,
         });

@@ -48,6 +48,32 @@ func TestAcquireSerializesDatabaseOwnersAndReleasesOnClose(t *testing.T) {
 	}
 }
 
+func TestAcquireDataDirectorySerializesRecoveryAndNormalRuntime(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "data")
+	first, err := AcquireDataDirectory(directory)
+	if err != nil {
+		t.Fatalf("acquire first data directory lock: %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	if first.DirectoryPath() == "" || filepath.Dir(first.Path()) != first.DirectoryPath() {
+		t.Fatalf("directory=%q lock=%q", first.DirectoryPath(), first.Path())
+	}
+	second, err := AcquireDataDirectory(directory)
+	if second != nil || !errors.Is(err, ErrLocked) {
+		t.Fatalf("second lock = %#v err=%v, want ErrLocked", second, err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("release first data directory lock: %v", err)
+	}
+	third, err := AcquireDataDirectory(directory)
+	if err != nil {
+		t.Fatalf("reacquire data directory lock: %v", err)
+	}
+	if err := third.Close(); err != nil {
+		t.Fatalf("release reacquired data directory lock: %v", err)
+	}
+}
+
 func TestAcquireCanonicalizesSymlinkedDatabasePaths(t *testing.T) {
 	root := t.TempDir()
 	realDirectory := filepath.Join(root, "real")

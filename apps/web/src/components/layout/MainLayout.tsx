@@ -16,6 +16,9 @@ import { DatabaseMaintenanceProvider } from '@/components/common/DatabaseMainten
 import { MainRoutes } from '@/router/MainRoutes';
 import {
   IconGithub,
+  IconChevronDown,
+  IconChevronRight,
+  IconExternalLink,
   IconSidebarAuthFiles,
   IconSidebarConfig,
   IconSidebarDashboard,
@@ -51,6 +54,7 @@ import {
 } from '@/features/plugins/pluginResources';
 import { triggerHeaderRefresh } from '@/hooks/useHeaderRefresh';
 import { usePanelFeatureAvailability } from '@/hooks/usePanelFeatureAvailability';
+import { collectManagerCustomPageEntries } from '@/features/custom-pages/customPages';
 import { getDemoLogoutPath, prefixRouteBase, stripRouteBase } from '@/features/demo/demoMode';
 import { LANGUAGE_LABEL_KEYS, LANGUAGE_ORDER, STORAGE_KEY_SIDEBAR } from '@/utils/constants';
 import { isSupportedLanguage } from '@/utils/language';
@@ -70,6 +74,7 @@ const sidebarIcons: Record<string, ReactNode> = {
   config: <IconSidebarConfig size={SIDEBAR_ICON_SIZE} />,
   logs: <IconSidebarLogs size={SIDEBAR_ICON_SIZE} />,
   system: <IconSidebarSystem size={SIDEBAR_ICON_SIZE} />,
+  customPages: <IconExternalLink size={SIDEBAR_ICON_SIZE} />,
 };
 
 // Header action icons - smaller size for header buttons
@@ -222,6 +227,7 @@ type NavItem = {
   shortLabel?: string;
   icon: ReactNode;
   exact?: boolean;
+  children?: NavItem[];
 };
 
 interface MainLayoutProps {
@@ -240,6 +246,8 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
   const connectionStatus = useAuthStore((state) => state.connectionStatus);
   const apiBase = useAuthStore((state) => state.apiBase);
   const supportsPlugin = useAuthStore((state) => state.supportsPlugin);
+  const recoveryMode = useAuthStore((state) => state.recoveryMode);
+  const isDatabaseRecoveryMode = recoveryMode === 'database_recovery';
 
   const config = useConfigStore((state) => state.config);
   const fetchConfig = useConfigStore((state) => state.fetchConfig);
@@ -265,6 +273,7 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const [visualEffectsMenuOpen, setVisualEffectsMenuOpen] = useState(false);
   const [pluginResources, setPluginResources] = useState<PluginResourceEntry[]>([]);
+  const [customPagesExpanded, setCustomPagesExpanded] = useState(true);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const languageMenuRef = useRef<HTMLDivElement | null>(null);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
@@ -274,6 +283,8 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
   const fullBrandName = 'CPA Manager Plus';
   const isLogsPage = routePathname.startsWith('/logs');
   const isPluginResourcePage = routePathname.startsWith('/plugin-pages');
+  const isCustomPage = routePathname.startsWith('/custom-pages');
+  const isEmbeddedResourcePage = isPluginResourcePage || isCustomPage;
   const showSidebarLabels = !sidebarCollapsed || sidebarOpen;
   const configPluginsEnabled = config?.pluginsEnabled;
   const pluginControlMenuVisible = isPluginManagementNavVisible({
@@ -466,10 +477,11 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
   );
 
   useEffect(() => {
+    if (isDatabaseRecoveryMode) return;
     fetchConfig().catch(() => {
       // ignore initial failure; login flow会提示
     });
-  }, [fetchConfig]);
+  }, [fetchConfig, isDatabaseRecoveryMode]);
 
   const loadPluginResources = useCallback(async () => {
     if (connectionStatus !== 'connected' || !supportsPlugin) {
@@ -516,7 +528,7 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
     shortLabel: navShortLabel('nav.dashboard', t('nav.dashboard')),
     icon: sidebarIcons.dashboard,
   };
-  const usageAnalyticsNavItem = featureAvailability.requestMonitoringAvailable
+  const usageAnalyticsNavItem = featureAvailability.managerServiceAvailable
     ? {
         path: '/usage-analytics',
         label: t('nav.usage_analytics'),
@@ -524,7 +536,7 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
         icon: sidebarIcons.usageAnalytics,
       }
     : null;
-  const monitoringNavItem = featureAvailability.requestMonitoringAvailable
+  const monitoringNavItem = featureAvailability.managerServiceAvailable
     ? {
         path: '/monitoring',
         label: t('nav.monitoring_center'),
@@ -558,56 +570,78 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
         icon: <PluginSidebarIcon src={resolvePluginAssetURL(resource.pluginLogo, apiBase)} />,
       }))
     : [];
-  const navSections: NavItem[][] = [
-    [
-      dashboardNavItem,
-      ...(usageAnalyticsNavItem ? [usageAnalyticsNavItem] : []),
-      ...(monitoringNavItem ? [monitoringNavItem] : []),
-    ],
-    [
-      {
-        path: '/config',
-        label: t('nav.config_management'),
-        shortLabel: navShortLabel('nav.config_management', t('nav.config_management')),
-        icon: sidebarIcons.config,
-      },
-      {
-        path: '/ai-providers',
-        label: t('nav.ai_providers'),
-        shortLabel: navShortLabel('nav.ai_providers', t('nav.ai_providers')),
-        icon: sidebarIcons.aiProviders,
-      },
-      ...pluginControlNavItems,
-    ],
-    [
-      {
-        path: '/accounts',
-        label: t('nav.accounts', { defaultValue: t('accounts.title') }),
-        shortLabel: navShortLabel(
-          'nav.accounts',
-          t('nav.accounts', { defaultValue: t('accounts.title') })
-        ),
-        icon: sidebarIcons.authFiles,
-      },
-      {
-        path: '/oauth',
-        label: t('nav.oauth', { defaultValue: 'OAuth' }),
-        shortLabel: navShortLabel('nav.oauth', t('nav.oauth', { defaultValue: 'OAuth' })),
-        icon: sidebarIcons.oauth,
-      },
-    ],
-    operationNavItems,
-    pluginResourceNavItems,
-    [
-      {
-        path: '/system',
-        label: t('nav.system_info'),
-        shortLabel: navShortLabel('nav.system_info', t('nav.system_info')),
-        icon: sidebarIcons.system,
-      },
-    ],
-  ].filter((section) => section.length > 0);
-  const navItems = navSections.flat();
+  const customPageNavItems: NavItem[] = collectManagerCustomPageEntries(
+    featureAvailability.customPages
+  ).map((page) => ({
+    path: page.route,
+    label: page.title,
+    shortLabel: page.title,
+    icon: <IconExternalLink size={16} />,
+    exact: true,
+  }));
+  const customPagesGroup: NavItem | null = customPageNavItems.length
+    ? {
+        path: '/custom-pages',
+        label: t('nav.custom_pages'),
+        shortLabel: navShortLabel('nav.custom_pages', t('nav.custom_pages')),
+        icon: sidebarIcons.customPages,
+        children: customPageNavItems,
+      }
+    : null;
+  const systemNavItem: NavItem = {
+    path: '/system',
+    label: t('nav.system_info'),
+    shortLabel: navShortLabel('nav.system_info', t('nav.system_info')),
+    icon: sidebarIcons.system,
+  };
+  const navSections: NavItem[][] = isDatabaseRecoveryMode
+    ? [[systemNavItem]]
+    : [
+        [
+          dashboardNavItem,
+          ...(usageAnalyticsNavItem ? [usageAnalyticsNavItem] : []),
+          ...(monitoringNavItem ? [monitoringNavItem] : []),
+        ],
+        [
+          {
+            path: '/config',
+            label: t('nav.config_management'),
+            shortLabel: navShortLabel('nav.config_management', t('nav.config_management')),
+            icon: sidebarIcons.config,
+          },
+          {
+            path: '/ai-providers',
+            label: t('nav.ai_providers'),
+            shortLabel: navShortLabel('nav.ai_providers', t('nav.ai_providers')),
+            icon: sidebarIcons.aiProviders,
+          },
+          ...pluginControlNavItems,
+        ],
+        [
+          {
+            path: '/accounts',
+            label: t('nav.accounts', { defaultValue: t('accounts.title') }),
+            shortLabel: navShortLabel(
+              'nav.accounts',
+              t('nav.accounts', { defaultValue: t('accounts.title') })
+            ),
+            icon: sidebarIcons.authFiles,
+          },
+          {
+            path: '/oauth',
+            label: t('nav.oauth', { defaultValue: 'OAuth' }),
+            shortLabel: navShortLabel('nav.oauth', t('nav.oauth', { defaultValue: 'OAuth' })),
+            icon: sidebarIcons.oauth,
+          },
+        ],
+        operationNavItems,
+        pluginResourceNavItems,
+        ...(customPagesGroup ? [[customPagesGroup]] : []),
+        [systemNavItem],
+      ].filter((section) => section.length > 0);
+  const navItems = navSections.flatMap((section) =>
+    section.flatMap((item) => item.children ?? [item])
+  );
   const navOrder = navItems.map((item) => item.path);
   const getRouteOrder = (pathname: string) => {
     const trimmedPath =
@@ -654,11 +688,11 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
 
   const handleRefreshAll = async () => {
     clearCache();
-    const results = await Promise.allSettled([
-      fetchConfig(undefined, true),
-      loadPluginResources(),
-      triggerHeaderRefresh(),
-    ]);
+    const results = await Promise.allSettled(
+      isDatabaseRecoveryMode
+        ? [triggerHeaderRefresh()]
+        : [fetchConfig(undefined, true), loadPluginResources(), triggerHeaderRefresh()]
+    );
     const rejected = results.find((result) => result.status === 'rejected');
     if (rejected && rejected.status === 'rejected') {
       const reason = rejected.reason;
@@ -691,6 +725,19 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
     item.path === '/' || item.exact
       ? pathname === item.path
       : pathname === item.path || pathname.startsWith(`${item.path}/`);
+  const handleCustomPagesToggle = () => {
+    if (sidebarCollapsed && !sidebarOpen) {
+      setSidebarCollapsed(false);
+      setCustomPagesExpanded(true);
+      try {
+        localStorage.setItem(STORAGE_KEY_SIDEBAR, 'false');
+      } catch {
+        /* ignore storage failures */
+      }
+      return;
+    }
+    setCustomPagesExpanded((expanded) => !expanded);
+  };
   const activeNavItem =
     [...navItems]
       .sort((a, b) => b.path.length - a.path.length)
@@ -704,7 +751,7 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
       className={[
         'app-shell',
         sidebarCollapsed ? 'sidebar-is-collapsed' : '',
-        isPluginResourcePage ? 'plugin-resource-shell' : '',
+        isEmbeddedResourcePage ? 'plugin-resource-shell' : '',
       ]
         .filter(Boolean)
         .join(' ')}
@@ -947,21 +994,69 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
             {navSections.map((section, sectionIndex) => (
               <div className="nav-menu-section" key={`nav-section-${sectionIndex}`}>
                 {sectionIndex > 0 && <div className="nav-menu-divider" aria-hidden="true" />}
-                {section.map((item) => (
-                  <NavLink
-                    key={item.path}
-                    to={prefixRouteBase(item.path, routeBase)}
-                    end={item.path === '/' || item.exact}
-                    className={({ isActive }) =>
-                      `nav-item ${isActive || matchesNavPath(item, currentPath) ? 'active' : ''}`
-                    }
-                    onClick={() => setSidebarOpen(false)}
-                    title={item.label}
-                  >
-                    <span className="nav-icon">{item.icon}</span>
-                    {showSidebarLabels && <span className="nav-label">{item.label}</span>}
-                  </NavLink>
-                ))}
+                {section.map((item) =>
+                  item.children ? (
+                    <div className="nav-menu-group" key={item.path}>
+                      <button
+                        type="button"
+                        className={`nav-item nav-group-toggle ${
+                          matchesNavPath(item, currentPath) ? 'active' : ''
+                        }`}
+                        onClick={handleCustomPagesToggle}
+                        title={item.label}
+                        aria-expanded={customPagesExpanded && showSidebarLabels}
+                        aria-controls="custom-pages-submenu"
+                      >
+                        <span className="nav-icon">{item.icon}</span>
+                        {showSidebarLabels && (
+                          <>
+                            <span className="nav-label">{item.label}</span>
+                            <span className="nav-group-chevron" aria-hidden="true">
+                              {customPagesExpanded ? (
+                                <IconChevronDown size={16} />
+                              ) : (
+                                <IconChevronRight size={16} />
+                              )}
+                            </span>
+                          </>
+                        )}
+                      </button>
+                      {customPagesExpanded && showSidebarLabels ? (
+                        <div className="nav-submenu" id="custom-pages-submenu">
+                          {item.children.map((child) => (
+                            <NavLink
+                              key={child.path}
+                              to={prefixRouteBase(child.path, routeBase)}
+                              end
+                              className={({ isActive }) =>
+                                `nav-item nav-submenu-item ${isActive ? 'active' : ''}`
+                              }
+                              onClick={() => setSidebarOpen(false)}
+                              title={child.label}
+                            >
+                              <span className="nav-icon">{child.icon}</span>
+                              <span className="nav-label">{child.label}</span>
+                            </NavLink>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <NavLink
+                      key={item.path}
+                      to={prefixRouteBase(item.path, routeBase)}
+                      end={item.path === '/' || item.exact}
+                      className={({ isActive }) =>
+                        `nav-item ${isActive || matchesNavPath(item, currentPath) ? 'active' : ''}`
+                      }
+                      onClick={() => setSidebarOpen(false)}
+                      title={item.label}
+                    >
+                      <span className="nav-icon">{item.icon}</span>
+                      {showSidebarLabels && <span className="nav-label">{item.label}</span>}
+                    </NavLink>
+                  )
+                )}
               </div>
             ))}
           </div>
@@ -971,7 +1066,7 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
           className={[
             'content',
             isLogsPage ? 'content-logs' : '',
-            isPluginResourcePage ? 'content-plugin-resource' : '',
+            isEmbeddedResourcePage ? 'content-plugin-resource' : '',
           ]
             .filter(Boolean)
             .join(' ')}
@@ -981,7 +1076,7 @@ function MainLayoutContent({ routeBase = '', demoMode = false }: MainLayoutProps
             className={[
               'main-content',
               isLogsPage ? 'main-content-logs' : '',
-              isPluginResourcePage ? 'main-content-plugin-resource' : '',
+              isEmbeddedResourcePage ? 'main-content-plugin-resource' : '',
             ]
               .filter(Boolean)
               .join(' ')}

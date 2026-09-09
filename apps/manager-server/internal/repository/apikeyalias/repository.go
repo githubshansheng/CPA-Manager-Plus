@@ -4,10 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
+	sqldialect "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 )
 
 type Repository interface {
@@ -17,17 +21,21 @@ type Repository interface {
 }
 
 type repository struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect sqldialect.Dialect
 }
 
 func New(db *sql.DB) Repository {
-	return &repository{db: db}
+	return NewForBackend(db, database.BackendSQLite)
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return &repository{db: db, dialect: sqldialect.ForBackend(backend)}
 }
 
 func (r *repository) LoadAll(ctx context.Context) ([]model.APIKeyAlias, error) {
 	rows, err := r.db.QueryContext(ctx, `select api_key_hash, alias, updated_at_ms
-		from api_key_aliases
-		order by alias collate nocase, api_key_hash`)
+		from api_key_aliases`)
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +49,18 @@ func (r *repository) LoadAll(ctx context.Context) ([]model.APIKeyAlias, error) {
 		}
 		aliases = append(aliases, alias)
 	}
-	return aliases, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(aliases, func(i, j int) bool {
+		left := apiKeyAliasSortKey(aliases[i].Alias)
+		right := apiKeyAliasSortKey(aliases[j].Alias)
+		if left != right {
+			return left < right
+		}
+		return aliases[i].APIKeyHash < aliases[j].APIKeyHash
+	})
+	return aliases, nil
 }
 
 func (r *repository) UpsertMany(ctx context.Context, aliases []model.APIKeyAlias, activeHashes []string, allowOrphanCleanup bool) error {
@@ -78,7 +97,14 @@ func (r *repository) UpsertMany(ctx context.Context, aliases []model.APIKeyAlias
 		}
 	}
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	var txOptions *sql.TxOptions
+	if r.dialect.IsMySQL() {
+		// Alias uniqueness is defined by Go's Unicode normalization rather
+		// than a lossy indexed prefix. SERIALIZABLE plus the full FOR UPDATE
+		// scan prevents two writers from claiming the same normalized alias.
+		txOptions = &sql.TxOptions{Isolation: sql.LevelSerializable}
+	}
+	tx, err := outboxcontext.Begin(ctx, r.db, txOptions)
 	if err != nil {
 		return err
 	}
@@ -88,10 +114,10 @@ func (r *repository) UpsertMany(ctx context.Context, aliases []model.APIKeyAlias
 
 	stmt, err := tx.PrepareContext(ctx, `insert into api_key_aliases (
 		api_key_hash, alias, updated_at_ms
-	) values (?, ?, ?)
-	on conflict(api_key_hash) do update set
-		alias = excluded.alias,
-		updated_at_ms = excluded.updated_at_ms`)
+	) values (?, ?, ?)`+r.dialect.UpsertClause(
+		[]string{"api_key_hash"},
+		[]string{"alias", "updated_at_ms"},
+	))
 	if err != nil {
 		return err
 	}
@@ -103,7 +129,7 @@ func (r *repository) UpsertMany(ctx context.Context, aliases []model.APIKeyAlias
 	}
 	defer deleteStmt.Close()
 
-	existingRows, err := tx.QueryContext(ctx, `select api_key_hash, alias from api_key_aliases`)
+	existingRows, err := tx.QueryContext(ctx, `select api_key_hash, alias from api_key_aliases`+r.dialect.ForUpdate())
 	if err != nil {
 		return err
 	}
@@ -159,7 +185,7 @@ func (r *repository) Delete(ctx context.Context, apiKeyHash string) error {
 	if !validAPIKeyHash(hash) {
 		return errors.New("valid apiKeyHash is required")
 	}
-	_, err := r.db.ExecContext(ctx, `delete from api_key_aliases where api_key_hash = ?`, hash)
+	_, err := outboxcontext.Exec(ctx, r.db, `delete from api_key_aliases where api_key_hash = ?`, hash)
 	return err
 }
 
@@ -185,6 +211,19 @@ func normalizeAPIKeyAlias(alias model.APIKeyAlias, now int64) (model.APIKeyAlias
 
 func normalizeAPIKeyAliasUniqueKey(alias string) string {
 	return strings.ToLower(strings.TrimSpace(alias))
+}
+
+// apiKeyAliasSortKey reproduces SQLite NOCASE ordering, which folds ASCII
+// letters only. Sorting in Go gives MySQL the same stable order without
+// depending on a server collation and preserves SQLite's existing behavior.
+func apiKeyAliasSortKey(alias string) string {
+	value := []byte(alias)
+	for index, char := range value {
+		if char >= 'A' && char <= 'Z' {
+			value[index] = char + ('a' - 'A')
+		}
+	}
+	return string(value)
 }
 
 func validAPIKeyHash(value string) bool {

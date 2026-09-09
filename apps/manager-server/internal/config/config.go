@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,10 @@ type Config struct {
 	AdminKey                     string
 	DataKey                      string
 	DataKeyPath                  string
+	SQLiteSourceState            string
+	SQLiteSourceSelectionPath    string
+	DBPathEnvSet                 bool
+	DataKeyPathEnvSet            bool
 	CollectorMode                string
 	Queue                        string
 	PopSide                      string
@@ -115,6 +120,13 @@ func LoadWithOptions(options LoadOptions) (Config, error) {
 	if !hasEnv("USAGE_DATA_DIR") && cfgFile.DBPath != "" {
 		dbPathFallback = resolveConfigPath(cfgFile.DBPath, cfgDir)
 	}
+	sqliteSource, sqliteSourceOK, err := LoadSQLiteSourceSelection(dataDir)
+	if err != nil {
+		return Config{}, err
+	}
+	if sqliteSourceOK {
+		dbPathFallback = sqliteSource.DatabasePath
+	}
 
 	managementKeyFile := defaultSecretFile
 	if cfgFile.ManagementKeyFile != "" {
@@ -134,6 +146,23 @@ func LoadWithOptions(options LoadOptions) (Config, error) {
 	if dataKeyPath == "" {
 		dataKeyPath = filepath.Join(dataDir, "data.key")
 	}
+	if sqliteSourceOK && sqliteSource.DataKeyPath != "" {
+		dataKeyPath = sqliteSource.DataKeyPath
+	}
+	if sqliteSourceOK {
+		if value := strings.TrimSpace(os.Getenv("USAGE_DB_PATH")); value != "" && !sameConfiguredPath(value, sqliteSource.DatabasePath) {
+			return Config{}, fmt.Errorf(
+				"USAGE_DB_PATH %q conflicts with adopted SQLite source %q", value, sqliteSource.DatabasePath,
+			)
+		}
+		if sqliteSource.DataKeyPath != "" {
+			if value := strings.TrimSpace(os.Getenv("CPA_MANAGER_DATA_KEY_PATH")); value != "" && !sameConfiguredPath(value, sqliteSource.DataKeyPath) {
+				return Config{}, fmt.Errorf(
+					"CPA_MANAGER_DATA_KEY_PATH %q conflicts with adopted SQLite data key %q", value, sqliteSource.DataKeyPath,
+				)
+			}
+		}
+	}
 
 	return Config{
 		HTTPAddr:                     env("HTTP_ADDR", stringFallback(cfgFile.HTTPAddr, "0.0.0.0:18317")),
@@ -144,6 +173,10 @@ func LoadWithOptions(options LoadOptions) (Config, error) {
 		AdminKey:                     readSecret("CPA_MANAGER_ADMIN_KEY", "CPA_MANAGER_ADMIN_KEY_FILE", adminKeyFile),
 		DataKey:                      readSecret("CPA_MANAGER_DATA_KEY", "CPA_MANAGER_DATA_KEY_FILE", dataKeyFile),
 		DataKeyPath:                  env("CPA_MANAGER_DATA_KEY_PATH", dataKeyPath),
+		SQLiteSourceState:            sqliteSource.State,
+		SQLiteSourceSelectionPath:    SQLiteSourceSelectionPath(dataDir),
+		DBPathEnvSet:                 hasEnv("USAGE_DB_PATH"),
+		DataKeyPathEnvSet:            hasEnv("CPA_MANAGER_DATA_KEY_PATH"),
 		CollectorMode:                normalizeCollectorMode(env("USAGE_COLLECTOR_MODE", stringFallback(cfgFile.CollectorMode, "auto"))),
 		Queue:                        env("USAGE_RESP_QUEUE", stringFallback(cfgFile.Queue, "usage")),
 		PopSide:                      env("USAGE_RESP_POP_SIDE", stringFallback(cfgFile.PopSide, "right")),
@@ -178,6 +211,26 @@ func LoadWithOptions(options LoadOptions) (Config, error) {
 		AccountActionsEnvSet:     hasEnv("USAGE_ACCOUNT_ACTIONS_ENABLED"),
 		AccountActionsAutoEnvSet: hasEnv("USAGE_ACCOUNT_ACTIONS_AUTO_DISABLE"),
 	}, nil
+}
+
+func sameConfiguredPath(left, right string) bool {
+	leftAbs, leftErr := filepath.Abs(strings.TrimSpace(left))
+	rightAbs, rightErr := filepath.Abs(strings.TrimSpace(right))
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftAbs = filepath.Clean(leftAbs)
+	rightAbs = filepath.Clean(rightAbs)
+	if resolved, err := filepath.EvalSymlinks(leftAbs); err == nil {
+		leftAbs = filepath.Clean(resolved)
+	}
+	if resolved, err := filepath.EvalSymlinks(rightAbs); err == nil {
+		rightAbs = filepath.Clean(resolved)
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(leftAbs, rightAbs)
+	}
+	return leftAbs == rightAbs
 }
 
 func loadFileConfig(options LoadOptions) (fileConfig, string, error) {

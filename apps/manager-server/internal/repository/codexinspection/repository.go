@@ -8,7 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
 
@@ -63,11 +66,16 @@ var (
 )
 
 type repository struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect dialect.Dialect
 }
 
 func New(db *sql.DB) Repository {
-	return &repository{db: db}
+	return NewForBackend(db, database.BackendSQLite)
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return &repository{db: db, dialect: dialect.ForBackend(backend)}
 }
 
 func (r *repository) CreateRun(ctx context.Context, run model.CodexInspectionRun) (model.CodexInspectionRun, error) {
@@ -87,10 +95,10 @@ func (r *repository) CreateRun(ctx context.Context, run model.CodexInspectionRun
 		run.SettingsJSON = model.MarshalCodexInspectionSettings(run.Settings)
 	}
 	var res sql.Result
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		var err error
-		res, err = r.db.ExecContext(
-			ctx,
+		res, err = outboxcontext.Exec(
+			ctx, r.db,
 			`insert into codex_inspection_runs (
 			trigger_type, trigger_key, status, started_at_ms, finished_at_ms,
 			total_files, probe_set_count, sampled_count, disabled_count, enabled_count,
@@ -142,9 +150,9 @@ func (r *repository) UpdateRun(ctx context.Context, run model.CodexInspectionRun
 	if run.SettingsJSON == "" {
 		run.SettingsJSON = model.MarshalCodexInspectionSettings(run.Settings)
 	}
-	err := withSQLiteBusyRetry(ctx, func() error {
-		res, err := r.db.ExecContext(
-			ctx,
+	err := r.withWriteRetry(ctx, func() error {
+		res, err := outboxcontext.Exec(
+			ctx, r.db,
 			`update codex_inspection_runs set
 			status = ?,
 			finished_at_ms = ?,
@@ -188,6 +196,17 @@ func (r *repository) UpdateRun(ctx context.Context, run model.CodexInspectionRun
 		changed, err := res.RowsAffected()
 		if err != nil {
 			return err
+		}
+		if changed == 0 && r.dialect.IsMySQL() {
+			var matched int
+			if err := r.db.QueryRowContext(ctx, `select count(*) from codex_inspection_runs
+				where id = ? and status = ? and status not in (?, ?)`, run.ID, run.Status,
+				model.CodexInspectionStatusRunning, model.CodexInspectionStatusCancelling).Scan(&matched); err != nil {
+				return err
+			}
+			if matched == 1 {
+				return nil
+			}
 		}
 		if changed != 1 {
 			return ErrRunStateConflict
@@ -233,72 +252,62 @@ func (r *repository) InsertResult(ctx context.Context, result model.CodexInspect
 	if result.AutoRecoverEligible {
 		autoRecoverEligible = 1
 	}
+	insertSQL := `insert into codex_inspection_results (
+		run_id, account_key, file_name, display_account, account_snapshot, auth_index, account_id,
+		provider, disabled, status, state, action, action_reason, status_code,
+		used_percent, is_quota, auto_recover_eligible, error, action_status, executed_action, action_error,
+		plan_type, quota_windows_json, error_kind, error_detail, created_at_ms
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	args := []any{
+		result.RunID,
+		result.AccountKey,
+		result.FileName,
+		result.DisplayAccount,
+		nullString(result.AccountSnapshot),
+		nullString(result.AuthIndex),
+		nullString(result.AccountID),
+		nullString(result.Provider),
+		disabled,
+		nullString(result.Status),
+		nullString(result.State),
+		result.Action,
+		nullString(result.ActionReason),
+		nullInt(result.StatusCode),
+		nullFloat(result.UsedPercent),
+		isQuota,
+		autoRecoverEligible,
+		nullString(result.Error),
+		nullString(result.ActionStatus),
+		nullString(result.ExecutedAction),
+		nullString(result.ActionError),
+		nullString(result.PlanType),
+		nullStringIf(result.QuotaInventoryObserved, result.QuotaWindowsJSON),
+		nullString(result.ErrorKind),
+		nullString(result.ErrorDetail),
+		result.CreatedAtMS,
+	}
 	var id int64
-	err := withSQLiteBusyRetry(ctx, func() error {
-		return r.db.QueryRowContext(
-			ctx,
-			`insert into codex_inspection_results (
-			run_id, account_key, file_name, display_account, account_snapshot, auth_index, account_id,
-			provider, disabled, status, state, action, action_reason, status_code,
-			used_percent, is_quota, auto_recover_eligible, error, action_status, executed_action, action_error,
-			plan_type, quota_windows_json, error_kind, error_detail, created_at_ms
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		on conflict(run_id, account_key) do update set
-			file_name = excluded.file_name,
-			display_account = excluded.display_account,
-			account_snapshot = excluded.account_snapshot,
-			auth_index = excluded.auth_index,
-			account_id = excluded.account_id,
-			provider = excluded.provider,
-			disabled = excluded.disabled,
-			status = excluded.status,
-			state = excluded.state,
-			action = excluded.action,
-			action_reason = excluded.action_reason,
-			status_code = excluded.status_code,
-			used_percent = excluded.used_percent,
-			is_quota = excluded.is_quota,
-			auto_recover_eligible = excluded.auto_recover_eligible,
-			error = excluded.error,
-			action_status = excluded.action_status,
-			executed_action = excluded.executed_action,
-			action_error = excluded.action_error,
-			plan_type = excluded.plan_type,
-			quota_windows_json = case
-				when excluded.quota_windows_json is not null then excluded.quota_windows_json
-				else codex_inspection_results.quota_windows_json
-			end,
-				error_kind = excluded.error_kind,
-				error_detail = excluded.error_detail,
-				created_at_ms = excluded.created_at_ms
-			returning id`,
-			result.RunID,
-			result.AccountKey,
-			result.FileName,
-			result.DisplayAccount,
-			nullString(result.AccountSnapshot),
-			nullString(result.AuthIndex),
-			nullString(result.AccountID),
-			nullString(result.Provider),
-			disabled,
-			nullString(result.Status),
-			nullString(result.State),
-			result.Action,
-			nullString(result.ActionReason),
-			nullInt(result.StatusCode),
-			nullFloat(result.UsedPercent),
-			isQuota,
-			autoRecoverEligible,
-			nullString(result.Error),
-			nullString(result.ActionStatus),
-			nullString(result.ExecutedAction),
-			nullString(result.ActionError),
-			nullString(result.PlanType),
-			nullStringIf(result.QuotaInventoryObserved, result.QuotaWindowsJSON),
-			nullString(result.ErrorKind),
-			nullString(result.ErrorDetail),
-			result.CreatedAtMS,
-		).Scan(&id)
+	err := r.withWriteRetry(ctx, func() error {
+		tx, err := r.beginWriteTx(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if r.dialect.IsMySQL() {
+			if _, err := tx.ExecContext(ctx, insertSQL+mysqlResultUpsertClause, args...); err != nil {
+				return err
+			}
+			// MySQL may return insert-id 0 for a no-op duplicate-key update even
+			// when LAST_INSERT_ID(expr) is present. A locking current read is
+			// deterministic under concurrent upserts and verifies the full key.
+			if err := tx.QueryRowContext(ctx, `select id from codex_inspection_results
+				where run_id = ? and account_key = ? for update`, result.RunID, result.AccountKey).Scan(&id); err != nil {
+				return err
+			}
+		} else if err := tx.QueryRowContext(ctx, insertSQL+sqliteResultUpsertClause+` returning id`, args...).Scan(&id); err != nil {
+			return err
+		}
+		return tx.Commit()
 	})
 	if err != nil {
 		return model.CodexInspectionResult{}, err
@@ -306,6 +315,60 @@ func (r *repository) InsertResult(ctx context.Context, result model.CodexInspect
 	result.ID = id
 	return result, nil
 }
+
+const sqliteResultUpsertClause = ` on conflict(run_id, account_key) do update set
+	file_name = excluded.file_name,
+	display_account = excluded.display_account,
+	account_snapshot = excluded.account_snapshot,
+	auth_index = excluded.auth_index,
+	account_id = excluded.account_id,
+	provider = excluded.provider,
+	disabled = excluded.disabled,
+	status = excluded.status,
+	state = excluded.state,
+	action = excluded.action,
+	action_reason = excluded.action_reason,
+	status_code = excluded.status_code,
+	used_percent = excluded.used_percent,
+	is_quota = excluded.is_quota,
+	auto_recover_eligible = excluded.auto_recover_eligible,
+	error = excluded.error,
+	action_status = excluded.action_status,
+	executed_action = excluded.executed_action,
+	action_error = excluded.action_error,
+	plan_type = excluded.plan_type,
+	quota_windows_json = case when excluded.quota_windows_json is not null
+		then excluded.quota_windows_json else codex_inspection_results.quota_windows_json end,
+	error_kind = excluded.error_kind,
+	error_detail = excluded.error_detail,
+	created_at_ms = excluded.created_at_ms`
+
+const mysqlResultUpsertClause = ` ON DUPLICATE KEY UPDATE
+	file_name = VALUES(file_name),
+	display_account = VALUES(display_account),
+	account_snapshot = VALUES(account_snapshot),
+	auth_index = VALUES(auth_index),
+	account_id = VALUES(account_id),
+	provider = VALUES(provider),
+	disabled = VALUES(disabled),
+	status = VALUES(status),
+	state = VALUES(state),
+	action = VALUES(action),
+	action_reason = VALUES(action_reason),
+	status_code = VALUES(status_code),
+	used_percent = VALUES(used_percent),
+	is_quota = VALUES(is_quota),
+	auto_recover_eligible = VALUES(auto_recover_eligible),
+	error = VALUES(error),
+	action_status = VALUES(action_status),
+	executed_action = VALUES(executed_action),
+	action_error = VALUES(action_error),
+	plan_type = VALUES(plan_type),
+	quota_windows_json = case when VALUES(quota_windows_json) is not null
+		then VALUES(quota_windows_json) else codex_inspection_results.quota_windows_json end,
+	error_kind = VALUES(error_kind),
+	error_detail = VALUES(error_detail),
+	created_at_ms = VALUES(created_at_ms)`
 
 func (r *repository) InsertLog(ctx context.Context, entry model.CodexInspectionLog) (model.CodexInspectionLog, error) {
 	if entry.CreatedAtMS <= 0 {
@@ -316,20 +379,25 @@ func (r *repository) InsertLog(ctx context.Context, entry model.CodexInspectionL
 			entry.DetailJSON = string(data)
 		}
 	}
-	var id int64
-	err := withSQLiteBusyRetry(ctx, func() error {
-		return r.db.QueryRowContext(
-			ctx,
+	var res sql.Result
+	err := r.withWriteRetry(ctx, func() error {
+		var err error
+		res, err = outboxcontext.Exec(
+			ctx, r.db,
 			`insert into codex_inspection_logs(run_id, level, message, detail_json, created_at_ms)
-			 values(?, ?, ?, ?, ?)
-			 returning id`,
+			 values(?, ?, ?, ?, ?)`,
 			entry.RunID,
 			entry.Level,
 			entry.Message,
 			nullString(entry.DetailJSON),
 			entry.CreatedAtMS,
-		).Scan(&id)
+		)
+		return err
 	})
+	if err != nil {
+		return model.CodexInspectionLog{}, err
+	}
+	id, err := res.LastInsertId()
 	if err != nil {
 		return model.CodexInspectionLog{}, err
 	}
@@ -515,19 +583,21 @@ func (r *repository) UpsertDisableOwnerships(ctx context.Context, items []model.
 		item.UpdatedAtMS = now
 		normalized[index] = item
 	}
-	return withSQLiteBusyRetry(ctx, func() error {
-		tx, err := r.db.BeginTx(ctx, nil)
+	return r.withWriteRetry(ctx, func() error {
+		tx, err := r.beginWriteTx(ctx)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
+		upsertClause := r.dialect.UpsertClause(
+			[]string{"file_name", "provider", "auth_index", "account_id", "account_snapshot"},
+			[]string{"disabled_at_ms", "updated_at_ms"},
+		)
 		for _, item := range normalized {
 			if _, err := tx.ExecContext(ctx, `insert into codex_inspection_disable_ownership (
 				file_name, provider, auth_index, account_id, account_snapshot, disabled_at_ms, updated_at_ms
 			) values (?, ?, ?, ?, ?, ?, ?)
-			on conflict(file_name, provider, auth_index, account_id, account_snapshot) do update set
-				disabled_at_ms = excluded.disabled_at_ms,
-				updated_at_ms = excluded.updated_at_ms`,
+			`+upsertClause,
 				item.FileName,
 				item.Provider,
 				item.AuthIndex,
@@ -556,7 +626,7 @@ func (r *repository) RevokeDisableOwnership(ctx context.Context, targets []model
 		return nil, nil
 	}
 	var revoked []model.CodexInspectionDisableOwnership
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		items, err := r.revokeDisableOwnershipOnce(ctx, targets, clearAll)
 		if err != nil {
 			revoked = nil
@@ -569,14 +639,14 @@ func (r *repository) RevokeDisableOwnership(ctx context.Context, targets []model
 }
 
 func (r *repository) revokeDisableOwnershipOnce(ctx context.Context, targets []model.CodexInspectionDisableOwnershipTarget, clearAll bool) ([]model.CodexInspectionDisableOwnership, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := r.beginWriteTx(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.QueryContext(ctx, `select file_name, provider, auth_index, account_id, account_snapshot, disabled_at_ms, updated_at_ms
-		from codex_inspection_disable_ownership`)
+		from codex_inspection_disable_ownership`+r.dialect.ForUpdate())
 	if err != nil {
 		return nil, err
 	}
@@ -630,17 +700,21 @@ func (r *repository) RestoreDisableOwnership(ctx context.Context, items []model.
 	if len(items) == 0 {
 		return nil
 	}
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		return r.restoreDisableOwnershipOnce(ctx, items)
 	})
 }
 
 func (r *repository) restoreDisableOwnershipOnce(ctx context.Context, items []model.CodexInspectionDisableOwnership) error {
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := r.beginWriteTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	ignoreClause := r.dialect.InsertDoNothingClause(
+		[]string{"file_name", "provider", "auth_index", "account_id", "account_snapshot"},
+		"file_name",
+	)
 	for _, item := range items {
 		item = normalizeDisableOwnership(item)
 		if item.FileName == "" {
@@ -653,7 +727,7 @@ func (r *repository) restoreDisableOwnershipOnce(ctx context.Context, items []mo
 		if _, err := tx.ExecContext(ctx, `insert into codex_inspection_disable_ownership (
 			file_name, provider, auth_index, account_id, account_snapshot, disabled_at_ms, updated_at_ms
 		) values (?, ?, ?, ?, ?, ?, ?)
-		on conflict(file_name, provider, auth_index, account_id, account_snapshot) do nothing`,
+		`+ignoreClause,
 			item.FileName,
 			item.Provider,
 			item.AuthIndex,

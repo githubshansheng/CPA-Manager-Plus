@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -278,7 +279,7 @@ func TestLoadOrCreateDataKeyCreatesStableRestrictedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat data key: %v", err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("data key permissions = %o, want 600", info.Mode().Perm())
 	}
 

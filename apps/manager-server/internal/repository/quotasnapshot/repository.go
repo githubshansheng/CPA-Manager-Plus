@@ -12,7 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 )
 
 const (
@@ -58,11 +61,32 @@ type Repository interface {
 }
 
 type repository struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect dialect.Dialect
 }
 
 func New(db *sql.DB) Repository {
-	return &repository{db: db}
+	return NewSQLite(db)
+}
+
+func NewSQLite(db *sql.DB) Repository {
+	return NewForBackend(db, database.BackendSQLite)
+}
+
+func NewMySQL(db *sql.DB) (Repository, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := dialect.ValidateMySQLSession(ctx, db); err != nil {
+		return nil, err
+	}
+	return NewForBackend(db, database.BackendMySQL), nil
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	if db == nil {
+		panic("quota snapshot repository database is required")
+	}
+	return &repository{db: db, dialect: dialect.ForBackend(backend)}
 }
 
 // ScopeFingerprint returns the canonical identity for one provider quota
@@ -95,14 +119,54 @@ func ScopeFingerprint(kind, key string, modelIDs []string) string {
 // group per transaction. Partial inventory is intentional: migration must not
 // infer provider removals that were never observed by the legacy writer.
 func BackfillLegacySnapshotsBatch(ctx context.Context, db *sql.DB, maxGroupSize int) (LegacyBackfillResult, error) {
+	return BackfillLegacySnapshotsBatchForBackend(ctx, db, database.BackendSQLite, maxGroupSize)
+}
+
+func BackfillLegacySnapshotsBatchForBackend(
+	ctx context.Context,
+	db *sql.DB,
+	backend database.BackendKind,
+	maxGroupSize int,
+) (LegacyBackfillResult, error) {
+	sqlDialect := dialect.ForBackend(backend)
+	for attempt := 0; ; attempt++ {
+		result, err := backfillLegacySnapshotsBatchOnce(ctx, db, sqlDialect, maxGroupSize)
+		if err == nil || attempt >= 3 || !sqlDialect.IsRetryableWriteConflict(err) {
+			return result, err
+		}
+		select {
+		case <-ctx.Done():
+			return LegacyBackfillResult{}, ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 10 * time.Millisecond):
+		}
+	}
+}
+
+func backfillLegacySnapshotsBatchOnce(
+	ctx context.Context,
+	db *sql.DB,
+	sqlDialect dialect.Dialect,
+	maxGroupSize int,
+) (LegacyBackfillResult, error) {
 	if maxGroupSize <= 0 {
 		maxGroupSize = 1000
 	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return LegacyBackfillResult{}, err
+	var tx *sql.Tx
+	var commit, rollback func() error
+	if sqlDialect.IsMySQL() {
+		mysqlTx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+		if err != nil {
+			return LegacyBackfillResult{}, err
+		}
+		tx, commit, rollback = mysqlTx, mysqlTx.Commit, mysqlTx.Rollback
+	} else {
+		authorityTx, err := outboxcontext.Begin(ctx, db, nil)
+		if err != nil {
+			return LegacyBackfillResult{}, err
+		}
+		tx, commit, rollback = authorityTx.Tx, authorityTx.Commit, authorityTx.Rollback
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = rollback() }()
 
 	firstRows, err := loadLegacySnapshots(ctx, tx, `where observation_id is null
 		and `+excludeLegacyCodexWorkspaceSnapshotSQL("")+`
@@ -120,10 +184,10 @@ func BackfillLegacySnapshotsBatch(ctx context.Context, db *sql.DB, maxGroupSize 
 	}
 	if len(firstRows) == 0 {
 		result := LegacyBackfillResult{Completed: true}
-		if err := updateLegacyBackfillState(ctx, tx, result); err != nil {
+		if err := updateLegacyBackfillState(ctx, tx, sqlDialect, result); err != nil {
 			return LegacyBackfillResult{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := commit(); err != nil {
 			return LegacyBackfillResult{}, err
 		}
 		return result, nil
@@ -187,7 +251,7 @@ func BackfillLegacySnapshotsBatch(ctx context.Context, db *sql.DB, maxGroupSize 
 	write.Observation.WindowCount = len(write.Snapshots)
 	write.Observation.ObservationHash = legacyObservationHash(groupKey, write.Snapshots)
 	writes := []model.AccountQuotaObservationWrite{write}
-	if err := insertObservationWrites(ctx, tx, writes); err != nil {
+	if err := insertObservationWrites(ctx, tx, sqlDialect, writes); err != nil {
 		return LegacyBackfillResult{}, err
 	}
 	processed := writes[0].InsertedSnapshotCount
@@ -204,10 +268,10 @@ func BackfillLegacySnapshotsBatch(ctx context.Context, db *sql.DB, maxGroupSize 
 		Pending:        pending != 0,
 		Completed:      pending == 0,
 	}
-	if err := updateLegacyBackfillState(ctx, tx, result); err != nil {
+	if err := updateLegacyBackfillState(ctx, tx, sqlDialect, result); err != nil {
 		return LegacyBackfillResult{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commit(); err != nil {
 		return LegacyBackfillResult{}, err
 	}
 	return result, nil
@@ -286,7 +350,12 @@ type legacyBackfillStateWriter interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
-func updateLegacyBackfillState(ctx context.Context, db legacyBackfillStateWriter, result LegacyBackfillResult) error {
+func updateLegacyBackfillState(
+	ctx context.Context,
+	db legacyBackfillStateWriter,
+	sqlDialect dialect.Dialect,
+	result LegacyBackfillResult,
+) error {
 	nowMS := time.Now().UnixMilli()
 	status := "running"
 	finishedAt := any(nil)
@@ -294,9 +363,13 @@ func updateLegacyBackfillState(ctx context.Context, db legacyBackfillStateWriter
 		status = "completed"
 		finishedAt = nowMS
 	}
+	targetMaximum := "max(target_event_id, coalesce((select max(id) from account_quota_snapshots), 0))"
+	if sqlDialect.IsMySQL() {
+		targetMaximum = "GREATEST(target_event_id, coalesce((select max(id) from account_quota_snapshots), 0))"
+	}
 	_, err := db.ExecContext(ctx, `update usage_data_migrations set
-		status = ?, last_event_id = max(last_event_id, ?),
-		target_event_id = max(target_event_id, coalesce((select max(id) from account_quota_snapshots), 0)),
+		status = ?, last_event_id = `+sqlDialect.MaxWithParameter("last_event_id")+`,
+		target_event_id = `+targetMaximum+`,
 		processed_rows = processed_rows + ?, changed_rows = changed_rows + ?,
 		started_at_ms = coalesce(started_at_ms, ?), updated_at_ms = ?,
 		finished_at_ms = ?, last_error = null where name = ?`,
@@ -515,63 +588,8 @@ func (r *repository) ListCandidates(ctx context.Context, accountKey, provider st
 	if limit <= 0 {
 		limit = defaultCandidateLimit
 	}
-	rows, err := r.db.QueryContext(ctx, `with ranked as (
-	select
-		id, coalesce(observation_id, 0) as observation_id,
-		coalesce(logical_window_id, 0) as logical_window_id,
-		coalesce(activation_id, 0) as activation_id,
-		coalesce(cycle_id, 0) as cycle_id,
-		account_key, provider, provider_window_id, window_kind, window_mode,
-		model_scope_kind, coalesce(model_scope_key, '') as model_scope_key,
-		coalesce(model_ids_json, '') as model_ids_json,
-		coalesce(scope_fingerprint, '') as scope_fingerprint,
-		coalesce(content_hash, '') as content_hash,
-		source, coalesce(source_observation_id, '') as source_observation_id, observed_at_ms,
-		boundary_accuracy, cycle_start_ms, cycle_end_ms, duration_seconds,
-		used_percent, remaining_percent, used_value, limit_value,
-		coalesce(quota_unit, '') as quota_unit, reset_credits_available,
-		coalesce(reset_credits_json, '') as reset_credits_json,
-		coalesce(plan_type, '') as plan_type, created_at_ms,
-		case when observation_id is null then 'active' else coalesce((
-			select availability from account_quota_windows window
-			where window.id = account_quota_snapshots.logical_window_id
-		), 'inactive') end as window_availability,
-		row_number() over (
-			partition by coalesce(
-				cast(logical_window_id as text),
-				'legacy:' || provider_window_id || char(0) || model_scope_kind ||
-				char(0) || coalesce(model_scope_key, '') || char(0) ||
-				coalesce(model_ids_json, '')
-			), source
-			order by observed_at_ms desc, id desc
-		) as source_rank
-		from account_quota_snapshots
-		where account_key = ? and provider = ?
-			and `+excludeLegacyCodexWorkspaceSnapshotSQL("")+`
-			and (observation_id is null or (
-				logical_window_id is not null and exists (
-					select 1 from account_quota_observations observation
-					where observation.id = account_quota_snapshots.observation_id
-						and observation.lifecycle_applied = 1
-				)
-			))
-	)
-	select
-		id, coalesce(observation_id, 0), coalesce(logical_window_id, 0),
-		coalesce(activation_id, 0), coalesce(cycle_id, 0),
-		account_key, provider, provider_window_id, window_kind, window_mode,
-		model_scope_kind, coalesce(model_scope_key, ''), coalesce(model_ids_json, ''),
-		coalesce(scope_fingerprint, ''), coalesce(content_hash, ''),
-		source, coalesce(source_observation_id, ''), observed_at_ms,
-		boundary_accuracy, cycle_start_ms, cycle_end_ms, duration_seconds,
-		used_percent, remaining_percent, used_value, limit_value,
-		coalesce(quota_unit, ''), reset_credits_available,
-		coalesce(reset_credits_json, ''), coalesce(plan_type, ''), created_at_ms
-	from ranked
-	where source_rank <= ?
-	order by case window_availability when 'active' then 0 when 'pending_absent' then 1 else 2 end,
-		source_rank, observed_at_ms desc, id desc
-	limit ?`, strings.TrimSpace(accountKey), strings.TrimSpace(provider), candidateRowsPerSource, limit)
+	query := r.listCandidatesQuery()
+	rows, err := r.db.QueryContext(ctx, query, strings.TrimSpace(accountKey), strings.TrimSpace(provider), candidateRowsPerSource, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -684,6 +702,74 @@ func (r *repository) ListCyclePlanEvidence(ctx context.Context, cycleIDs []int64
 		return nil, err
 	}
 	return evidenceByCycle, nil
+}
+
+func (r *repository) listCandidatesQuery() string {
+	query := `with ranked as (
+	select
+		id, coalesce(observation_id, 0) as observation_id,
+		coalesce(logical_window_id, 0) as logical_window_id,
+		coalesce(activation_id, 0) as activation_id,
+		coalesce(cycle_id, 0) as cycle_id,
+		account_key, provider, provider_window_id, window_kind, window_mode,
+		model_scope_kind, coalesce(model_scope_key, '') as model_scope_key,
+		coalesce(model_ids_json, '') as model_ids_json,
+		coalesce(scope_fingerprint, '') as scope_fingerprint,
+		coalesce(content_hash, '') as content_hash,
+		source, coalesce(source_observation_id, '') as source_observation_id, observed_at_ms,
+		boundary_accuracy, cycle_start_ms, cycle_end_ms, duration_seconds,
+		used_percent, remaining_percent, used_value, limit_value,
+		coalesce(quota_unit, '') as quota_unit, reset_credits_available,
+		coalesce(reset_credits_json, '') as reset_credits_json,
+		coalesce(plan_type, '') as plan_type, created_at_ms,
+		case when observation_id is null then 'active' else coalesce((
+			select availability from account_quota_windows quota_window
+			where quota_window.id = account_quota_snapshots.logical_window_id
+		), 'inactive') end as window_availability,
+		row_number() over (
+			partition by coalesce(
+				cast(logical_window_id as text),
+				'legacy:' || provider_window_id || char(0) || model_scope_kind ||
+				char(0) || coalesce(model_scope_key, '') || char(0) ||
+				coalesce(model_ids_json, '')
+			), source
+			order by observed_at_ms desc, id desc
+		) as source_rank
+		from account_quota_snapshots
+		where account_key = ? and provider = ?
+			and ` + excludeLegacyCodexWorkspaceSnapshotSQL("") + `
+			and (observation_id is null or (
+				logical_window_id is not null and exists (
+					select 1 from account_quota_observations observation
+					where observation.id = account_quota_snapshots.observation_id
+						and observation.lifecycle_applied = 1
+				)
+			))
+	)
+	select
+		id, coalesce(observation_id, 0), coalesce(logical_window_id, 0),
+		coalesce(activation_id, 0), coalesce(cycle_id, 0),
+		account_key, provider, provider_window_id, window_kind, window_mode,
+		model_scope_kind, coalesce(model_scope_key, ''), coalesce(model_ids_json, ''),
+		coalesce(scope_fingerprint, ''), coalesce(content_hash, ''),
+		source, coalesce(source_observation_id, ''), observed_at_ms,
+		boundary_accuracy, cycle_start_ms, cycle_end_ms, duration_seconds,
+		used_percent, remaining_percent, used_value, limit_value,
+		coalesce(quota_unit, ''), reset_credits_available,
+		coalesce(reset_credits_json, ''), coalesce(plan_type, ''), created_at_ms
+	from ranked
+	where source_rank <= ?
+	order by case window_availability when 'active' then 0 when 'pending_absent' then 1 else 2 end,
+		source_rank, observed_at_ms desc, id desc
+	limit ?`
+	if r.dialect.IsMySQL() {
+		query = strings.NewReplacer(
+			"cast(logical_window_id as text)", "cast(logical_window_id as char)",
+			"'legacy:' || provider_window_id || char(0) || model_scope_kind ||\n\t\t\t\tchar(0) || coalesce(model_scope_key, '') || char(0) ||\n\t\t\t\tcoalesce(model_ids_json, '')",
+			"concat('legacy:', provider_window_id, char(0), model_scope_kind, char(0), coalesce(model_scope_key, ''), char(0), coalesce(model_ids_json, ''))",
+		).Replace(query)
+	}
+	return query
 }
 
 func nullString(value string) any {

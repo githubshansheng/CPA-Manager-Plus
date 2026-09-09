@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
@@ -60,11 +62,12 @@ type Repository interface {
 }
 
 type repository struct {
-	db *sql.DB
+	db      *sql.DB
+	backend database.BackendKind
 }
 
 func New(db *sql.DB) Repository {
-	return &repository{db: db}
+	return NewSQLite(db)
 }
 
 type preparedUsageEvent struct {
@@ -248,8 +251,12 @@ func (r *repository) prepareUsageEvent(rawEvent model.UsageEvent) preparedUsageE
 		failed = 1
 	}
 	metadataJSON, quotaRecoverAtMS, quotaUsedPercent, quotaPlanType, errorKind, errorCode, traceID := responseHeaderDerivedForInsert(event)
-	failSummary := event.FailSummary
-	rawJSON := event.RawJSON
+	failSummarySource := event.FailSummary
+	if failSummarySource == "" {
+		failSummarySource = event.FailBody
+	}
+	failSummary := usage.FailSummaryFromBody(failSummarySource)
+	rawJSON := usage.SafeRawJSON(event.RawJSON)
 
 	ledgerNowMS := event.CreatedAtMS
 	if ledgerNowMS <= 0 {
@@ -355,8 +362,8 @@ func (r *repository) InsertBatch(ctx context.Context, events []model.UsageEvent)
 		preparedList = append(preparedList, prepared)
 	}
 
-	// Phase 5: SQLite write transaction - strictly short atomic DB writes only
-	tx, err := r.db.BeginTx(ctx, nil)
+	// Phase 5: backend write transaction - strictly short atomic DB writes only
+	tx, _, err := r.beginInsertTx(ctx)
 	if err != nil {
 		return model.InsertResult{}, err
 	}
@@ -364,15 +371,16 @@ func (r *repository) InsertBatch(ctx context.Context, events []model.UsageEvent)
 		_ = tx.Rollback()
 	}()
 
-	ledgerStmt, err := tx.PrepareContext(ctx, `insert or ignore into usage_event_identity_ledger (
+	ledgerStmt, err := tx.PrepareContext(ctx, r.insertIfAbsentSQL(`insert or ignore into usage_event_identity_ledger (
 		event_hash,
 		raw_event_id,
 		timestamp_ms,
 		bucket_ms,
 		aggregate_schema_version,
+		aggregate_structure_revision,
 		first_seen_at_ms,
 		updated_at_ms
-	) values (?, null, ?, ?, 0, ?, ?)`)
+	) values (?, null, ?, ?, 0, '', ?, ?)`))
 	if err != nil {
 		return model.InsertResult{}, err
 	}
@@ -401,7 +409,7 @@ func (r *repository) InsertBatch(ctx context.Context, events []model.UsageEvent)
 	}
 	defer attachExistingLedgerStmt.Close()
 
-	stmt, err := tx.PrepareContext(ctx, `insert or ignore into usage_events (
+	stmt, err := tx.PrepareContext(ctx, r.insertIfAbsentSQL(`insert or ignore into usage_events (
 		request_id, event_hash, timestamp_ms, timestamp, provider, executor_type, model, endpoint, method, path,
 		client_ip, x_forwarded_for, user_agent,
 		auth_type, auth_index, source, source_hash, api_key_hash,
@@ -414,7 +422,7 @@ func (r *repository) InsertBatch(ctx context.Context, events []model.UsageEvent)
 		fail_body, raw_json,
 		response_model, session_id, parent_session_id, access_token_sha256, generate, stream,
 		created_at_ms
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`))
 	if err != nil {
 		return model.InsertResult{}, err
 	}
@@ -550,11 +558,22 @@ func (r *repository) InsertBatch(ctx context.Context, events []model.UsageEvent)
 	return result, nil
 }
 
+func (r *repository) beginInsertTx(ctx context.Context) (usageEventTx, *sql.Tx, error) {
+	if r.isMySQL() {
+		return r.beginMySQLWriteTx(ctx)
+	}
+	tx, err := outboxcontext.Begin(ctx, r.db, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tx, tx.Tx, nil
+}
+
 func (r *repository) ListRecent(ctx context.Context, limit int) ([]model.UsageEvent, error) {
 	if limit <= 0 {
 		limit = 50000
 	}
-	rows, err := r.db.QueryContext(ctx, `select
+	rows, err := r.queryContext(ctx, `select
 		request_id, event_hash, timestamp_ms, timestamp, provider, executor_type, model, endpoint, method, path,
 		client_ip, x_forwarded_for, user_agent,
 		auth_type, auth_index, source, source_hash, api_key_hash,
@@ -759,7 +778,7 @@ func (r *repository) ListRecent(ctx context.Context, limit int) ([]model.UsageEv
 
 func (r *repository) Count(ctx context.Context) (int64, error) {
 	var count int64
-	if err := r.db.QueryRowContext(ctx, `select count(*) from usage_events`).Scan(&count); err != nil {
+	if err := r.queryRowContext(ctx, `select count(*) from usage_events`).Scan(&count); err != nil {
 		return 0, err
 	}
 	return count, nil

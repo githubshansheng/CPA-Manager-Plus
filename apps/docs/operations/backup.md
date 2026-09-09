@@ -9,9 +9,20 @@ CPAMP 的请求历史、配置和加密凭证都在本机。备份时最容易�
 - `usage.sqlite`
 - `usage.sqlite-wal`
 - `usage.sqlite-shm`
+- `database-control.json.enc`
+- `database-control.json.enc.bak`（存在时）
+- `mysql-ca-*.pem`（配置自定义 MySQL CA 证书时）
 - `data.key`
 
 如果部署目录还有自定义配置文件，也应一起备份。使用一键安装脚本时，至少额外备份安装目录中的 `secrets/` 和 `data/`；成功导入后通常不会再有 `secrets/cpa-management-key`，但升级失败或 `CPAMP_SKIP_EXECUTE=1` 时该临时文件可能仍需保留以便重试。手动 env/secret 部署仍应备份对应 secret 文件。
+
+`database-control.json.enc` 保存数据库路由 generation、脱敏连接信息、加密后的 MySQL 密码、认证副本和迁移/故障切换状态。它必须与同一份 `data.key` 一起恢复；不要单独复制到另一套实例。
+
+## 启用 MySQL 后的备份边界
+
+MySQL 切为业务主读并清理 SQLite 历史后，MySQL 是 15 天缓存窗口之外的唯一全历史副本。数据目录备份不包含外部 MySQL 数据，必须另外建立 MySQL 物理备份或一致性逻辑备份，并定期做恢复演练。
+
+备份前确认系统信息中的同步积压为 `0`，记录源/目标水位和当前 routing generation。恢复时必须把 MySQL、整个 CPAMP 数据目录和 `data.key` 作为同一恢复点处理；禁止把较新的控制文件与较旧的 MySQL 备份混用。MySQL→SQLite 按钮只重建配置和最近 N 天缓存，不能代替 MySQL 全历史备份。
 
 ## 为什么必须备份 data.key
 
@@ -63,12 +74,34 @@ Copy-Item -Recurse .\data .\data.backup
 
 1. 停止 CPAMP。
 2. 恢复完整数据目录。
-3. 确认 `usage.sqlite` 和 `data.key` 来自同一次备份。
+3. 确认 `usage.sqlite`、`database-control.json.enc` 和 `data.key` 来自同一次备份。
 4. 如果使用 env/secret 管理 CPA 连接，同时恢复安装目录里的 `secrets/`。
 5. 启动 CPAMP。
 6. 登录后检查配置、监控数据和采集器状态。
 
 如果恢复后出现解密失败，优先检查 `data.key` 是否和 SQLite 匹配。
+
+## 直接接管或切换现有 SQLite
+
+首次初始化可以选择“接管旧 SQLite”；项目已经初始化后，可以在“系统信息 → 数据库管理”中选择“切换 SQLite 数据源”。两种方式都会让 Manager Server 在下一次启动时**直接打开指定文件**，不会复制数据库。路径必须是 Manager Server 所在主机或容器内可访问的绝对路径；浏览器本机路径只有在浏览器和服务运行于同一文件系统时才有效。
+
+接管前应按以下顺序准备：
+
+1. 正常停止所有仍在使用该数据库的旧 CPAMP 实例。
+2. 关闭 `sqlite3`、数据库浏览器、备份脚本和维护任务，包括仅执行查询的长事务。只读连接通常不会独占锁住整个数据库，但可能阻止 WAL checkpoint 或 truncate 完成。
+3. 把 `usage.sqlite`、仍存在的 `usage.sqlite-wal`/`usage.sqlite-shm` 和匹配的 `data.key` 当作同一恢复点；不要从不同时间点拼接。
+4. 在面板输入 SQLite 绝对路径。旧库包含加密 CPA 连接时，还要输入匹配的 `data.key` 绝对路径；旧库已有管理员凭证时，还要验证旧 Admin Key。
+5. 运行预检并确认旧实例及工具均已停止。预检会验证文件权限、CPA Manager 表结构、`PRAGMA quick_check(1)`、写锁、data key 和管理员凭证。
+
+正常启动的 Manager Server 会持有数据库旁的进程锁；因此另一个遵守同一锁协议的实例不能同时接管该 SQLite。SQLite WAL 只能改善短事务的读写并发，不是多实例协调机制。绕开进程锁或让其他程序持续写入同一数据库，仍可能产生 `database is locked`、checkpoint 长时间不能完成，甚至造成不一致的恢复点。
+
+如果设置了 `USAGE_DB_PATH`，面板不能覆盖 SQLite 路径；如果设置了 `CPA_MANAGER_DATA_KEY_PATH`，面板也不能选择不同的 data key。先移除冲突的环境变量并正常重启，再执行接管。运行中切换只允许数据库拓扑处于稳定的纯 SQLite 状态：三个读写主路由均为 SQLite、未配置 MySQL、未启用同步、没有迁移或故障切换，并且 SQLite cleanup/rebuild 已结束。
+
+保存选择后，当前进程继续使用原数据库。面板会显示待切换路径和“重启 Manager Server”按钮；只有用户点击后，服务才会依次停止 HTTP、后台 worker、WAL 维护和连接池，释放进程锁，再打开目标数据库。请勿用浏览器刷新代替重启。
+
+选择记录保存在数据目录的 `.cpa-manager-plus.sqlite-source.json`。切换时，当前 `database-control.json.enc` 及其 `.bak` 会按 `.before-sqlite-switch-<timestamp>` 后缀归档，避免不同 data key 的控制状态混用。若目标在重启阶段消失、被占用、data key 不匹配或初始化失败，服务会释放目标资源、恢复旧 SQLite 和旧控制文件、自动重新启动，并在系统信息中保留失败路径、阶段及底层原因；失败目标生成的控制文件以 `.failed-target` 后缀保留供排查。
+
+旧库已有管理员凭证时，重启后使用旧 Admin Key 登录。旧库没有管理员凭证时，确认切换会把当前凭证的 salt/hash 写入目标库，因此仍使用当前 Admin Key；明文 Admin Key 不会写入数据源选择文件。
 
 ## 不保留请求历史，只迁移 Manager 配置
 

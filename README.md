@@ -142,6 +142,58 @@ CPAMP_DRY_RUN=1 bash install-cpamp.sh
 
 See [One-Click Installer](https://seakee.github.io/CPA-Manager-Plus/docs/en/deployment/installer.html) for upgrade, repair, and admin-key recovery behavior.
 
+### One-Click Source Build And Runtime
+
+Node.js 22+, npm, and Go 1.24+ are required. The scripts build the production
+web panel, embed it into a temporary copy of the Go source, and manage the
+resulting native executable without Docker.
+
+Windows:
+
+```powershell
+.\cpa-manager-plus.bat start
+.\cpa-manager-plus.bat status
+.\cpa-manager-plus.bat rebuild
+.\cpa-manager-plus.bat logs 120
+.\cpa-manager-plus.bat admin-key
+.\cpa-manager-plus.bat stop
+```
+
+Linux / macOS:
+
+```bash
+chmod +x cpa-manager-plus.sh
+./cpa-manager-plus.sh start
+./cpa-manager-plus.sh status
+./cpa-manager-plus.sh rebuild
+./cpa-manager-plus.sh logs 120
+./cpa-manager-plus.sh admin-key
+./cpa-manager-plus.sh stop
+```
+
+| Command     | Behavior                                                                                         |
+| ----------- | ------------------------------------------------------------------------------------------------ |
+| `build`     | Install dependencies and build the web panel and Go service without starting it                  |
+| `start`     | Start the service, building first when the local binary is missing                               |
+| `stop`      | Stop only the background process managed by the source script                                    |
+| `restart`   | Restart the existing binary                                                                      |
+| `rebuild`   | Build a candidate while serving, then stop, replace, and start; roll back if the new build fails |
+| `status`    | Validate PID metadata and the `/health` endpoint                                                 |
+| `logs`      | Print or follow stdout and stderr logs                                                           |
+| `admin-key` | Print the locally managed source-runtime admin key                                               |
+
+The default address is `http://127.0.0.1:18317`; use `--port 18318` to override
+it. Build artifacts, source-runtime data, PID metadata, and logs stay under
+`.local/`, isolated from Docker volumes. `build` and `rebuild` run `npm ci` by
+default; set `CPA_MANAGER_PLUS_SKIP_NPM_CI=1` only when dependencies are already
+current. On first start, the scripts save a generated admin key in the private
+`.local/data/admin.key` file so restarts cannot lose it when logs rotate. Use
+`admin-key` to display it. Treat `.local/data/`, the admin key, and runtime logs
+as sensitive data. Explicit `CPA_MANAGER_ADMIN_KEY` or
+`CPA_MANAGER_ADMIN_KEY_FILE` settings remain externally managed, are synchronized
+to the selected SQLite database on the next restart, and are never displayed by
+`admin-key`.
+
 ### CPA + CPAMP Together
 
 ```yaml

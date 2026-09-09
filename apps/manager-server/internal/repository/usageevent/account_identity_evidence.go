@@ -19,7 +19,13 @@ const (
 // range. The caller commits these rows and its coverage checkpoint together.
 // Keep all providers and identity values: contradictory evidence must survive
 // compaction and reach the same authority check as the raw reader.
-func UpsertCodexLegacyIdentityEvidenceRange(ctx context.Context, tx *sql.Tx, revision string, afterID, throughID int64) error {
+type codexLegacyIdentityTx interface {
+	SQLQueryer
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func UpsertCodexLegacyIdentityEvidenceRange(ctx context.Context, tx codexLegacyIdentityTx, revision string, afterID, throughID int64) error {
 	if throughID <= afterID {
 		return nil
 	}
@@ -32,19 +38,42 @@ func UpsertCodexLegacyIdentityEvidenceRange(ctx context.Context, tx *sql.Tx, rev
 		{"e.source", "e.auth_file_snapshot = ''" + legacySourceIdentityGuards()},
 	}
 	for kind, physical := range physicalPredicates {
+		physicalValue := physical.column
+		authIndexValue := "e.auth_index"
+		physicalGroup := physical.column + " collate nocase"
+		authIndexGroup := "e.auth_index collate nocase"
+		identityGroupHash := ""
+		if queryerIsMySQL(tx) {
+			// SQLite's evidence key is case-insensitive. Canonical lower-case
+			// values preserve that identity contract on the binary MySQL schema.
+			physicalValue = "lower(" + physical.column + ")"
+			authIndexValue = "lower(e.auth_index)"
+			physicalGroup = physicalValue
+			authIndexGroup = authIndexValue
+			identityGroupHash = `,
+			unhex(sha2(cast(json_array(` + physicalValue + `, ` + authIndexValue + `,
+				coalesce(e.provider, ''), coalesce(e.auth_provider_snapshot, ''),
+				coalesce(e.auth_account_id_snapshot, ''), coalesce(e.auth_project_id_snapshot, ''),
+				coalesce(e.account_snapshot, '')
+			) as char character set utf8mb4), 256))`
+		}
 		query := `insert into ` + CodexLegacyIdentityEvidenceTable + ` (
 			structure_revision, physical_kind, physical_file, auth_index,
 			provider, auth_provider_snapshot, auth_account_id_snapshot,
 			auth_project_id_snapshot, account_snapshot,
 			min_evidence_at_ms, max_evidence_at_ms, chronology_unknown
-		) select ?, ?, ` + physical.column + `, e.auth_index, ` + legacyAccountIdentityEvidenceColumns + `
+		) select ?, ?, ` + physicalValue + `, ` + authIndexValue + `, ` + legacyAccountIdentityEvidenceColumns + `
 		from usage_events e not indexed
 		where e.id > ? and e.id <= ?
 			and coalesce(e.auth_index, '') <> ''
 			and coalesce(` + physical.column + `, '') <> ''
 			and ` + physical.filter + legacyAccountIdentityEvidenceGroupBy + `,
-			` + physical.column + ` collate nocase, e.auth_index collate nocase
-		on conflict do update set
+			` + physicalGroup + `, ` + authIndexGroup + identityGroupHash + `
+		on conflict (
+			structure_revision, physical_kind, physical_file, auth_index,
+			provider, auth_provider_snapshot, auth_account_id_snapshot,
+			auth_project_id_snapshot, account_snapshot
+		) do update set
 			min_evidence_at_ms = case
 				when min_evidence_at_ms = 0 then excluded.min_evidence_at_ms
 				when excluded.min_evidence_at_ms = 0 then min_evidence_at_ms
@@ -61,10 +90,14 @@ func UpsertCodexLegacyIdentityEvidenceRange(ctx context.Context, tx *sql.Tx, rev
 
 // ClearCodexLegacyIdentityEvidenceBatch removes a previous evidence revision
 // in bounded transactions before a new revision starts rebuilding.
-func ClearCodexLegacyIdentityEvidenceBatch(ctx context.Context, tx *sql.Tx, limit int) (bool, error) {
-	if _, err := tx.ExecContext(ctx, `delete from `+CodexLegacyIdentityEvidenceTable+` where rowid in (
-		select rowid from `+CodexLegacyIdentityEvidenceTable+` limit ?
-	)`, limit); err != nil {
+func ClearCodexLegacyIdentityEvidenceBatch(ctx context.Context, tx codexLegacyIdentityTx, limit int) (bool, error) {
+	query := `delete from ` + CodexLegacyIdentityEvidenceTable + ` where rowid in (
+		select rowid from ` + CodexLegacyIdentityEvidenceTable + ` limit ?
+	)`
+	if queryerIsMySQL(tx) {
+		query = `delete from ` + CodexLegacyIdentityEvidenceTable + ` limit ?`
+	}
+	if _, err := tx.ExecContext(ctx, query, limit); err != nil {
 		return false, err
 	}
 	var pending bool
@@ -79,13 +112,17 @@ func queryStoredCodexLegacyIdentityEvidence(ctx context.Context, queryer SQLQuer
 	}
 	groups := make([]legacyAccountIdentityEvidence, 0)
 	for kind, predicate := range legacyAccountIdentityPredicates(authFile, authIndex) {
+		identityPredicate := `physical_file = ? collate nocase and auth_index = ? collate nocase`
+		if queryerIsMySQL(queryer) {
+			identityPredicate = `lower(physical_file) = lower(?) and lower(auth_index) = lower(?)`
+		}
 		rows, err := queryer.QueryContext(ctx, `select
 			provider, auth_provider_snapshot, auth_account_id_snapshot,
 			auth_project_id_snapshot, account_snapshot,
 			min_evidence_at_ms, max_evidence_at_ms, chronology_unknown
 		from `+CodexLegacyIdentityEvidenceTable+`
 		where structure_revision = ? and physical_kind = ?
-			and physical_file = ? collate nocase and auth_index = ? collate nocase`,
+			and `+identityPredicate,
 			CodexLegacyIdentityEvidenceRevision, kind, authFile, authIndex)
 		if err != nil {
 			return nil, false, err
@@ -101,7 +138,7 @@ func queryStoredCodexLegacyIdentityEvidence(ctx context.Context, queryer SQLQuer
 		// NOT INDEXED retains the bounded rowid range instead of letting SQLite
 		// revisit the credential's entire historical file/source index range.
 		query := `select ` + legacyAccountIdentityEvidenceColumns + `from usage_events e not indexed
-		where e.id > ? and e.id <= ? and ` + predicate.sql + legacyAccountIdentityEvidenceGroupBy
+		where e.id > ? and e.id <= ? and ` + legacyAccountIdentityPredicateSQL(queryer, predicate.sql) + legacyAccountIdentityEvidenceGroupBy
 		args := append([]any{coverageID, latestID}, predicate.args...)
 		rows, err = queryer.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -117,12 +154,16 @@ func queryStoredCodexLegacyIdentityEvidence(ctx context.Context, queryer SQLQuer
 }
 
 func codexLegacyIdentityEvidenceReadState(ctx context.Context, queryer SQLQueryer) (int64, int64, bool, error) {
+	tableExistsSQL := `select 1 from sqlite_master where type = 'table' and name = ?`
+	if queryerIsMySQL(queryer) {
+		tableExistsSQL = `select 1 from information_schema.tables where table_schema = database() and table_name = ?`
+	}
 	rows, err := queryer.QueryContext(ctx, `select
 		s.schema_version, s.structure_revision, s.status, s.coverage_event_id,
 		coalesce((select max(id) from usage_events), 0)
 	from usage_monitoring_rollup_state s
 	where s.rollup_name = ? and exists (
-		select 1 from sqlite_master where type = 'table' and name = ?
+		`+tableExistsSQL+`
 	)`, CodexLegacyIdentityRollupName, CodexLegacyIdentityEvidenceTable)
 	if err != nil {
 		return 0, 0, false, err
@@ -154,7 +195,7 @@ func codexLegacyIdentityEvidenceReadState(ctx context.Context, queryer SQLQuerye
 	if coverageID != latestID {
 		rows, err := queryer.QueryContext(ctx, `select count(*) from (
 			select id from usage_events where id > ? order by id limit ?
-		)`, coverageID, codexLegacyIdentityTailLimit+1)
+		) as codex_identity_tail`, coverageID, codexLegacyIdentityTailLimit+1)
 		if err != nil {
 			return 0, 0, false, err
 		}
@@ -179,4 +220,12 @@ func codexLegacyIdentityEvidenceReadState(ctx context.Context, queryer SQLQuerye
 		}
 	}
 	return coverageID, latestID, true, nil
+}
+
+func queryerIsMySQL(queryer SQLQueryer) bool {
+	type mysqlQueryer interface {
+		IsMySQL() bool
+	}
+	aware, ok := queryer.(mysqlQueryer)
+	return ok && aware.IsMySQL()
 }

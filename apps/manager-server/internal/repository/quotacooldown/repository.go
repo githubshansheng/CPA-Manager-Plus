@@ -9,7 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 )
 
 type Repository interface {
@@ -22,11 +25,32 @@ type Repository interface {
 }
 
 type repository struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect dialect.Dialect
 }
 
 func New(db *sql.DB) Repository {
-	return &repository{db: db}
+	return NewSQLite(db)
+}
+
+func NewSQLite(db *sql.DB) Repository {
+	return NewForBackend(db, database.BackendSQLite)
+}
+
+func NewMySQL(db *sql.DB) (Repository, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := dialect.ValidateMySQLSession(ctx, db); err != nil {
+		return nil, err
+	}
+	return NewForBackend(db, database.BackendMySQL), nil
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	if db == nil {
+		panic("quota cooldown repository database is required")
+	}
+	return &repository{db: db, dialect: dialect.ForBackend(backend)}
 }
 
 func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCooldownUpsert) (model.QuotaCooldown, error) {
@@ -55,12 +79,29 @@ func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCoold
 	if cooldown.ObservedEnabledAtMS > cooldown.DisabledAtMS {
 		return model.QuotaCooldown{}, errors.New("quota cooldown observed_enabled_at_ms must not exceed disabled_at_ms")
 	}
+	for attempt := 0; ; attempt++ {
+		item, err := r.upsertActiveOnce(ctx, cooldown, now)
+		if err == nil || attempt >= 3 || !r.dialect.IsRetryableWriteConflict(err) {
+			return item, err
+		}
+		select {
+		case <-ctx.Done():
+			return model.QuotaCooldown{}, ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 10 * time.Millisecond):
+		}
+	}
+}
 
-	tx, err := r.db.BeginTx(ctx, nil)
+func (r *repository) upsertActiveOnce(
+	ctx context.Context,
+	cooldown model.QuotaCooldownUpsert,
+	now int64,
+) (model.QuotaCooldown, error) {
+	tx, commit, rollback, err := r.beginWriteTx(ctx)
 	if err != nil {
 		return model.QuotaCooldown{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = rollback() }()
 
 	authIndexIdentity, providerIdentity, accountSnapshotIdentity := cooldownIdentity(cooldown)
 	id, found, err := querySingleCooldownID(ctx, tx, `select id from quota_cooldowns
@@ -78,7 +119,7 @@ func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCoold
 				when coalesce(trim(auth_index), '') <> '' then ''
 				else coalesce(trim(account_snapshot), '')
 			end = ?
-		order by id asc limit 2`,
+		order by id asc limit 2`+r.dialect.ForUpdate(),
 		cooldown.AuthFileName,
 		cooldown.Owner,
 		model.QuotaCooldownStatusActive,
@@ -102,7 +143,7 @@ func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCoold
 						else coalesce(lower(replace(trim(provider), '_', '-')), '')
 					end = ?
 					and coalesce(trim(account_snapshot), '') = ?
-				order by id asc limit 2`,
+				order by id asc limit 2`+r.dialect.ForUpdate(),
 				cooldown.AuthFileName,
 				cooldown.Owner,
 				model.QuotaCooldownStatusActive,
@@ -178,12 +219,12 @@ func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCoold
 				when ? >= recover_at_ms then coalesce(nullif(?, ''), evidence_json)
 				else evidence_json
 			end,
-			recover_at_ms = max(recover_at_ms, ?),
+			recover_at_ms = `+r.dialect.MaxWithParameter("recover_at_ms")+`,
 			event_hash = case
 				when ? >= recover_at_ms then coalesce(nullif(?, ''), event_hash)
 				else event_hash
 			end,
-			disabled_at_ms = min(disabled_at_ms, ?),
+			disabled_at_ms = `+r.dialect.MinWithParameter("disabled_at_ms")+`,
 			last_error = null,
 			updated_at_ms = ?
 		where id = ?`,
@@ -214,10 +255,27 @@ func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCoold
 	if !ok {
 		return model.QuotaCooldown{}, sql.ErrNoRows
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commit(); err != nil {
 		return model.QuotaCooldown{}, err
 	}
 	return item, nil
+}
+
+func (r *repository) beginWriteTx(
+	ctx context.Context,
+) (*sql.Tx, func() error, func() error, error) {
+	if r.dialect.IsMySQL() {
+		tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return tx, tx.Commit, tx.Rollback, nil
+	}
+	tx, err := outboxcontext.Begin(ctx, r.db, nil)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return tx.Tx, tx.Commit, tx.Rollback, nil
 }
 
 func querySingleCooldownID(ctx context.Context, tx *sql.Tx, query string, args ...any) (int64, bool, error) {
@@ -290,20 +348,27 @@ func (r *repository) MarkRecovered(ctx context.Context, id int64, recoveredAtMS 
 	if recoveredAtMS <= 0 {
 		recoveredAtMS = time.Now().UnixMilli()
 	}
-	_, err := r.db.ExecContext(ctx, `update quota_cooldowns set status = ?, recovered_at_ms = ?, last_error = null, updated_at_ms = ? where id = ?`, model.QuotaCooldownStatusRecovered, recoveredAtMS, recoveredAtMS, id)
+	_, err := r.execWrite(ctx, `update quota_cooldowns set status = ?, recovered_at_ms = ?, last_error = null, updated_at_ms = ? where id = ?`, model.QuotaCooldownStatusRecovered, recoveredAtMS, recoveredAtMS, id)
 	return err
 }
 
 func (r *repository) MarkSkipped(ctx context.Context, id int64, reason string) error {
 	now := time.Now().UnixMilli()
-	_, err := r.db.ExecContext(ctx, `update quota_cooldowns set status = ?, last_error = ?, updated_at_ms = ? where id = ?`, model.QuotaCooldownStatusSkipped, nullString(reason), now, id)
+	_, err := r.execWrite(ctx, `update quota_cooldowns set status = ?, last_error = ?, updated_at_ms = ? where id = ?`, model.QuotaCooldownStatusSkipped, nullString(reason), now, id)
 	return err
 }
 
 func (r *repository) RecordFailure(ctx context.Context, id int64, reason string) error {
 	now := time.Now().UnixMilli()
-	_, err := r.db.ExecContext(ctx, `update quota_cooldowns set last_error = ?, updated_at_ms = ? where id = ? and status = ?`, nullString(reason), now, id, model.QuotaCooldownStatusActive)
+	_, err := r.execWrite(ctx, `update quota_cooldowns set last_error = ?, updated_at_ms = ? where id = ? and status = ?`, nullString(reason), now, id, model.QuotaCooldownStatusActive)
 	return err
+}
+
+func (r *repository) execWrite(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if r.dialect.IsMySQL() {
+		return r.db.ExecContext(ctx, query, args...)
+	}
+	return outboxcontext.Exec(ctx, r.db, query, args...)
 }
 
 const selectQuotaCooldowns = `select

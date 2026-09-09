@@ -37,4 +37,8 @@ func WriteCORS(cfg config.Config, w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+	w.Header().Set(
+		"Access-Control-Expose-Headers",
+		"X-CPAMP-Data-Source, X-CPAMP-Data-Completeness, X-CPAMP-Coverage-From-Ms, X-CPAMP-Coverage-To-Ms",
+	)
 }

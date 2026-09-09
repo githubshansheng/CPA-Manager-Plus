@@ -14,11 +14,43 @@ var (
 )
 
 type Lock struct {
-	file         *os.File
-	databasePath string
-	lockPath     string
-	closeOnce    sync.Once
-	closeErr     error
+	file          *os.File
+	databasePath  string
+	directoryPath string
+	lockPath      string
+	closeOnce     sync.Once
+	closeErr      error
+}
+
+// AcquireDataDirectory serializes every runtime that shares a data directory,
+// including recovery mode where SQLite itself may be unavailable. The lock
+// file is persistent; the operating-system lock is released by Close.
+func AcquireDataDirectory(directory string) (*Lock, error) {
+	absolutePath, err := filepath.Abs(directory)
+	if err != nil {
+		return nil, fmt.Errorf("resolve manager data directory: %w", err)
+	}
+	absolutePath = filepath.Clean(absolutePath)
+	if err := os.MkdirAll(absolutePath, 0o700); err != nil {
+		return nil, fmt.Errorf("create manager data directory: %w", err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(absolutePath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve manager data directory: %w", err)
+	}
+	lockPath := filepath.Join(resolvedPath, ".cpa-manager-plus.manager.lock")
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open manager data directory process lock %s: %w", lockPath, err)
+	}
+	if err := lockFile(file); err != nil {
+		_ = file.Close()
+		if errors.Is(err, ErrLocked) {
+			return nil, fmt.Errorf("%w for data directory %s", ErrLocked, resolvedPath)
+		}
+		return nil, fmt.Errorf("acquire manager data directory process lock %s: %w", lockPath, err)
+	}
+	return &Lock{file: file, directoryPath: filepath.Clean(resolvedPath), lockPath: lockPath}, nil
 }
 
 func Acquire(databasePath string) (*Lock, error) {
@@ -102,6 +134,13 @@ func (l *Lock) DatabasePath() string {
 		return ""
 	}
 	return l.databasePath
+}
+
+func (l *Lock) DirectoryPath() string {
+	if l == nil {
+		return ""
+	}
+	return l.directoryPath
 }
 
 func (l *Lock) Path() string {

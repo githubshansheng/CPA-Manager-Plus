@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"strings"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
 
@@ -64,12 +65,13 @@ func (r *repository) ResolveCodexLegacyAccountKey(
 	if err != nil {
 		return "", false, err
 	}
-	defer func() { _ = tx.Rollback() }()
-	key, allowed, err := ResolveCodexLegacyAccountKey(ctx, tx, fields)
+	queryTx := dialect.WrapTx(tx, dialect.ForBackend(r.backend))
+	defer func() { _ = queryTx.Rollback() }()
+	key, allowed, err := ResolveCodexLegacyAccountKey(ctx, queryTx, fields)
 	if err != nil {
 		return "", false, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := queryTx.Commit(); err != nil {
 		return "", false, err
 	}
 	return key, allowed, nil
@@ -189,11 +191,24 @@ func queryLegacyAccountIdentityEvidence(
 	queryer SQLQueryer,
 	predicate legacyAccountIdentityPredicate,
 ) ([]legacyAccountIdentityEvidence, error) {
-	rows, err := queryer.QueryContext(ctx, legacyAccountIdentityEvidenceSelect+predicate.sql+legacyAccountIdentityEvidenceGroupBy, predicate.args...)
+	rows, err := queryer.QueryContext(ctx, legacyAccountIdentityEvidenceSelect+
+		legacyAccountIdentityPredicateSQL(queryer, predicate.sql)+legacyAccountIdentityEvidenceGroupBy,
+		predicate.args...)
 	if err != nil {
 		return nil, err
 	}
 	return scanLegacyAccountIdentityEvidenceRows(rows)
+}
+
+func legacyAccountIdentityPredicateSQL(queryer SQLQueryer, predicate string) string {
+	if !queryerIsMySQL(queryer) {
+		return predicate
+	}
+	return strings.NewReplacer(
+		"e.auth_file_snapshot collate nocase = ?", "lower(e.auth_file_snapshot) = lower(?)",
+		"e.source collate nocase = ?", "lower(e.source) = lower(?)",
+		"e.auth_index collate nocase = ?", "lower(e.auth_index) = lower(?)",
+	).Replace(predicate)
 }
 
 func scanLegacyAccountIdentityEvidenceRows(rows *sql.Rows) ([]legacyAccountIdentityEvidence, error) {

@@ -60,7 +60,7 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cooldowns, err := h.App.Store.QuotaCooldowns.ListActive(r.Context())
+	cooldowns, err := h.App.Store.ListActiveQuotaCooldowns(r.Context())
 	if err != nil {
 		response.Error(w, http.StatusInternalServerError, err)
 		return

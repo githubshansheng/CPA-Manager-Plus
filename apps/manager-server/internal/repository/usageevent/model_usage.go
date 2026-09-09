@@ -14,7 +14,7 @@ func (r *repository) ModelUsageSummary(ctx context.Context, limit int) (model.Mo
 		limit = defaultModelUsageLimit
 	}
 
-	rows, err := r.db.QueryContext(ctx, `with recent as (
+	rows, err := r.queryContext(ctx, `with recent as (
 		select `+usageidentity.SQLRequestAnalyticsModelExpression("model", "requested_model")+` as model, coalesce(resolved_model, '') as resolved_model
 		from usage_events
 		order by timestamp_ms desc, id desc
@@ -59,7 +59,7 @@ func (r *repository) ModelUsageSummary(ctx context.Context, limit int) (model.Mo
 	}
 
 	var totalEvents int64
-	if err := r.db.QueryRowContext(ctx, `select count(*) from usage_events`).Scan(&totalEvents); err != nil {
+	if err := r.queryRowContext(ctx, `select count(*) from usage_events`).Scan(&totalEvents); err != nil {
 		return model.ModelUsageSummary{}, err
 	}
 

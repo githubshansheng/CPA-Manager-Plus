@@ -11,6 +11,7 @@ export function ProtectedRoute({ children }: { children: ReactElement }) {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const managementKey = useAuthStore((state) => state.managementKey);
   const apiBase = useAuthStore((state) => state.apiBase);
+  const recoveryMode = useAuthStore((state) => state.recoveryMode);
   const restoreSession = useAuthStore((state) => state.restoreSession);
   const [checking, setChecking] = useState(false);
 
@@ -28,16 +29,19 @@ export function ProtectedRoute({ children }: { children: ReactElement }) {
             detectedUsageService = false;
           }
           const hostedManagementPage =
-            typeof window !== 'undefined' &&
-            /\/management\.html$/i.test(window.location.pathname);
+            typeof window !== 'undefined' && /\/management\.html$/i.test(window.location.pathname);
           const result = await restoreSession({
             expectedMode: detectedUsageService ? 'manager_embedded' : 'external_panel',
             expectedPanelBase:
               detectedUsageService || hostedManagementPage ? detectedBase : undefined,
           });
-          if (result && result.recoveryMode === 'manager_config') {
-            localStorage.setItem('config-management:tab', 'manager');
-            navigate('/config', { replace: true });
+          if (result) {
+            if (result.recoveryMode === 'manager_config') {
+              localStorage.setItem('config-management:tab', 'manager');
+              navigate('/config', { replace: true });
+            } else if (result.recoveryMode === 'database_recovery') {
+              navigate('/system', { replace: true });
+            }
           }
         } finally {
           setChecking(false);
@@ -57,6 +61,10 @@ export function ProtectedRoute({ children }: { children: ReactElement }) {
 
   if (!isAuthenticated) {
     return <Navigate to="/login" replace state={{ from: location }} />;
+  }
+
+  if (recoveryMode === 'database_recovery' && location.pathname !== '/system') {
+    return <Navigate to="/system" replace />;
   }
 
   return children;

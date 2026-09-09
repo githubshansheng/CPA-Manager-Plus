@@ -353,7 +353,9 @@
   font-size: 14px;
   line-height: 1;
   cursor: pointer;
-  transition: background-color 120ms ease, color 120ms ease;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
 
   &:hover:not(:disabled) {
     background: color-mix(in srgb, var(--text-primary) 8%, transparent);
@@ -439,6 +441,130 @@
   box-shadow: none !important;
   font-size: 14px !important;
   font-weight: 400 !important;
+}
+
+.customMenuAddLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.customMenuAddButton {
+  @include mobile {
+    min-height: 44px;
+  }
+}
+
+.customMenuEmpty {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 18px;
+  border: 1px dashed color-mix(in srgb, var(--border-color) 86%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-subtle) 76%, transparent);
+  text-align: center;
+
+  strong {
+    color: var(--text-primary);
+    font-size: 14px;
+  }
+
+  span {
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+}
+
+.customMenuList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.customMenuItem {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-primary) 88%, transparent);
+}
+
+.customMenuItemHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+
+  > strong {
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+}
+
+.customMenuItemActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+
+  :global(.btn) {
+    width: 36px;
+    min-width: 36px;
+    height: 36px;
+    padding: 0;
+  }
+
+  :global(.btn-danger),
+  :global(.btn):last-child:hover:not(:disabled) {
+    color: var(--danger-color);
+  }
+
+  @include mobile {
+    :global(.btn) {
+      width: 44px;
+      min-width: 44px;
+      height: 44px;
+    }
+  }
+}
+
+.customMenuFields {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.72fr) minmax(280px, 1.28fr);
+  gap: 12px;
+  align-items: start;
+
+  :global(.form-group) {
+    margin-bottom: 0;
+  }
+
+  @include mobile {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.customMenuValidationSummary,
+.customMenuSecurityHint {
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.customMenuValidationSummary {
+  border: 1px solid var(--failure-badge-border);
+  background: var(--failure-badge-bg);
+  color: var(--failure-badge-text);
+}
+
+.customMenuSecurityHint {
+  border: 1px solid color-mix(in srgb, var(--warning-border) 72%, var(--border-color));
+  background: color-mix(in srgb, var(--warning-bg) 64%, var(--bg-primary));
+  color: var(--warning-text);
 }
 
 .managerMetaGrid {

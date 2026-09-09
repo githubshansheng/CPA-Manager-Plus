@@ -40,6 +40,8 @@ import iconMinimax from '@/assets/icons/minimax.svg';
 import iconMeta from '@/assets/icons/meta.svg';
 import { DatabaseStatusCard } from './components/DatabaseStatusCard';
 import { useManagerUpdates } from './ManagerUpdates';
+import { DatabaseManagementPanel } from './components/DatabaseManagementPanel';
+import { resolveRestartManagementKey } from './restartAuthentication';
 import styles from './SystemPage.module.scss';
 
 const MODEL_CATEGORY_ICONS: Record<string, string | { light: string; dark: string }> = {
@@ -56,13 +58,15 @@ const MODEL_CATEGORY_ICONS: Record<string, string | { light: string; dark: strin
   minimax: iconMinimax,
 };
 
-const DATABASE_STATUS_REFRESH_INTERVAL_MS = 60_000;
+const DATABASE_STATUS_IDLE_REFRESH_INTERVAL_MS = 30_000;
+const DATABASE_STATUS_ACTIVE_REFRESH_INTERVAL_MS = 5_000;
 
 export function SystemPage() {
   const { t, i18n } = useTranslation();
   const { showNotification, showConfirmation } = useNotificationStore();
   const resolvedTheme = useThemeStore((state) => state.resolvedTheme);
   const auth = useAuthStore();
+  const isDatabaseRecoveryMode = auth.recoveryMode === 'database_recovery';
   const featureAvailability = usePanelFeatureAvailability();
   const updates = useManagerUpdates();
   const config = useConfigStore((state) => state.config);
@@ -187,11 +191,12 @@ export function SystemPage() {
   const refreshDatabaseStatus = useCallback(async () => {
     const requestId = databaseRequestId.current + 1;
     databaseRequestId.current = requestId;
+    const currentManagementKey = useAuthStore.getState().managementKey;
 
     if (
       !featureAvailability.managerServiceAvailable ||
       !featureAvailability.managerServiceBase ||
-      !auth.managementKey
+      !currentManagementKey
     ) {
       setDatabaseStatus(null);
       setDatabaseError('');
@@ -204,7 +209,7 @@ export function SystemPage() {
     try {
       const status = await usageServiceApi.getStatus(
         featureAvailability.managerServiceBase,
-        auth.managementKey
+        currentManagementKey
       );
       if (databaseRequestId.current !== requestId) return;
       setDatabaseStatus(status);
@@ -217,11 +222,7 @@ export function SystemPage() {
         setDatabaseLoading(false);
       }
     }
-  }, [
-    auth.managementKey,
-    featureAvailability.managerServiceAvailable,
-    featureAvailability.managerServiceBase,
-  ]);
+  }, [featureAvailability.managerServiceAvailable, featureAvailability.managerServiceBase]);
 
   const handleClearLoginStorage = () => {
     showConfirmation({
@@ -246,29 +247,87 @@ export function SystemPage() {
     });
   };
 
+  const handleManagerRestartRecovered = useCallback(
+    async (nextManagementKey: string) => {
+      const currentAuth = useAuthStore.getState();
+      const apiBase = currentAuth.apiBase || featureAvailability.managerServiceBase;
+      let verifiedManagementKey: string;
+      try {
+        verifiedManagementKey = await resolveRestartManagementKey({
+          preferredKey: nextManagementKey,
+          fallbackKey: currentAuth.managementKey,
+          verify: (candidateKey) => usageServiceApi.getStatus(apiBase, candidateKey),
+        });
+      } catch (error) {
+        useAuthStore.getState().logout();
+        throw error;
+      }
+
+      try {
+        await currentAuth.login({
+          apiBase,
+          managementKey: verifiedManagementKey,
+          rememberPassword: currentAuth.rememberPassword,
+          sessionMode: currentAuth.sessionMode || 'manager_embedded',
+          sessionPanelBase: currentAuth.sessionPanelBase || featureAvailability.managerServiceBase,
+        });
+      } catch (error) {
+        useAuthStore.getState().logout();
+        throw error;
+      }
+    },
+    [featureAvailability.managerServiceBase]
+  );
+
   useEffect(() => {
+    if (isDatabaseRecoveryMode) return;
     fetchConfig().catch(() => {
       // ignore
     });
-  }, [fetchConfig]);
+  }, [fetchConfig, isDatabaseRecoveryMode]);
 
   useEffect(() => {
+    if (isDatabaseRecoveryMode) return;
     fetchModels();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auth.connectionStatus, auth.apiBase]);
+  }, [auth.connectionStatus, auth.apiBase, isDatabaseRecoveryMode]);
 
   useEffect(() => {
     if (featureAvailability.checking) return;
     void refreshDatabaseStatus();
-  }, [featureAvailability.checking, refreshDatabaseStatus]);
+  }, [auth.managementKey, featureAvailability.checking, refreshDatabaseStatus]);
 
   useEffect(() => {
     if (!featureAvailability.managerServiceAvailable) return;
-    const timer = window.setInterval(() => {
-      void refreshDatabaseStatus();
-    }, DATABASE_STATUS_REFRESH_INTERVAL_MS);
+    const migrationState =
+      databaseStatus?.databaseMigration?.state ?? databaseStatus?.databaseMigration?.status;
+    const replicationState = databaseStatus?.replication?.state;
+    const validationInProgress = databaseStatus?.databaseMigration?.validationProgress?.running;
+    const isActive =
+      ['pending', 'running', 'validating'].includes(migrationState ?? '') ||
+      validationInProgress ||
+      databaseStatus?.replication?.enabled ||
+      databaseStatus?.replication?.stalled ||
+      ['running', 'warning', 'stalled'].includes(replicationState ?? '');
+    const timer = window.setInterval(
+      () => {
+        void refreshDatabaseStatus();
+      },
+      isActive
+        ? DATABASE_STATUS_ACTIVE_REFRESH_INTERVAL_MS
+        : DATABASE_STATUS_IDLE_REFRESH_INTERVAL_MS
+    );
     return () => window.clearInterval(timer);
-  }, [featureAvailability.managerServiceAvailable, refreshDatabaseStatus]);
+  }, [
+    databaseStatus?.databaseMigration?.state,
+    databaseStatus?.databaseMigration?.status,
+    databaseStatus?.databaseMigration?.validationProgress?.running,
+    databaseStatus?.replication?.enabled,
+    databaseStatus?.replication?.stalled,
+    databaseStatus?.replication?.state,
+    featureAvailability.managerServiceAvailable,
+    refreshDatabaseStatus,
+  ]);
 
   useHeaderRefresh(refreshDatabaseStatus, featureAvailability.managerServiceAvailable);
 
@@ -344,69 +403,84 @@ export function SystemPage() {
           </div>
         </Card>
 
-        {featureAvailability.managerServiceAvailable && (
+        {featureAvailability.managerServiceAvailable &&
+        databaseStatus &&
+        (databaseStatus.databaseTopology || databaseStatus.databases) ? (
+          <DatabaseManagementPanel
+            status={databaseStatus}
+            base={featureAvailability.managerServiceBase}
+            managementKey={auth.managementKey}
+            loading={databaseLoading}
+            onRefresh={refreshDatabaseStatus}
+            onRestartRecovered={handleManagerRestartRecovered}
+          />
+        ) : featureAvailability.managerServiceAvailable ? (
           <DatabaseStatusCard
             status={databaseStatus}
             loading={databaseLoading}
             error={databaseError}
           />
-        )}
+        ) : null}
 
-        <Card
-          title={t('system_info.models_title')}
-          extra={
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => fetchModels({ forceRefresh: true })}
-              loading={modelsLoading}
-            >
-              {t('common.refresh')}
-            </Button>
-          }
-        >
-          <p className={styles.sectionDescription}>{t('system_info.models_desc')}</p>
-          {modelStatus && (
-            <div className={`status-badge ${modelStatus.type}`}>{modelStatus.message}</div>
-          )}
-          {modelsError && <div className="error-box">{modelsError}</div>}
-          {modelsLoading ? (
-            <div className="hint">{t('common.loading')}</div>
-          ) : models.length === 0 ? (
-            <div className="hint">{t('system_info.models_empty')}</div>
-          ) : (
-            <div className="item-list">
-              {groupedModels.map((group) => {
-                const iconSrc = getIconForCategory(group.id);
-                return (
-                  <div key={group.id} className="item-row">
-                    <div className="item-meta">
-                      <div className={styles.groupTitle}>
-                        {iconSrc && <img src={iconSrc} alt="" className={styles.groupIcon} />}
-                        <span className="item-title">{group.label}</span>
+        {!isDatabaseRecoveryMode && (
+          <Card
+            title={t('system_info.models_title')}
+            extra={
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => fetchModels({ forceRefresh: true })}
+                loading={modelsLoading}
+              >
+                {t('common.refresh')}
+              </Button>
+            }
+          >
+            <p className={styles.sectionDescription}>{t('system_info.models_desc')}</p>
+            {modelStatus && (
+              <div className={`status-badge ${modelStatus.type}`}>{modelStatus.message}</div>
+            )}
+            {modelsError && <div className="error-box">{modelsError}</div>}
+            {modelsLoading ? (
+              <div className="hint">{t('common.loading')}</div>
+            ) : models.length === 0 ? (
+              <div className="hint">{t('system_info.models_empty')}</div>
+            ) : (
+              <div className="item-list">
+                {groupedModels.map((group) => {
+                  const iconSrc = getIconForCategory(group.id);
+                  return (
+                    <div key={group.id} className="item-row">
+                      <div className="item-meta">
+                        <div className={styles.groupTitle}>
+                          {iconSrc && <img src={iconSrc} alt="" className={styles.groupIcon} />}
+                          <span className="item-title">{group.label}</span>
+                        </div>
+                        <div className="item-subtitle">
+                          {t('system_info.models_count', { count: group.items.length })}
+                        </div>
                       </div>
-                      <div className="item-subtitle">
-                        {t('system_info.models_count', { count: group.items.length })}
+                      <div className={styles.modelTags}>
+                        {group.items.map((model) => (
+                          <span
+                            key={`${model.name}-${model.alias ?? 'default'}`}
+                            className={styles.modelTag}
+                            title={model.description || ''}
+                          >
+                            <span className={styles.modelName}>{model.name}</span>
+                            {model.alias && (
+                              <span className={styles.modelAlias}>{model.alias}</span>
+                            )}
+                          </span>
+                        ))}
                       </div>
                     </div>
-                    <div className={styles.modelTags}>
-                      {group.items.map((model) => (
-                        <span
-                          key={`${model.name}-${model.alias ?? 'default'}`}
-                          className={styles.modelTag}
-                          title={model.description || ''}
-                        >
-                          <span className={styles.modelName}>{model.name}</span>
-                          {model.alias && <span className={styles.modelAlias}>{model.alias}</span>}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </Card>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
+        )}
 
         <Card title={t('system_info.clear_login_title')}>
           <p className={styles.sectionDescription}>{t('system_info.clear_login_desc')}</p>

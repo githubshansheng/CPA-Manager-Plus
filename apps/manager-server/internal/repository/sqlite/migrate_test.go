@@ -1086,7 +1086,9 @@ func TestUsageMonitoringModelFormatUpgradeRebuildsDerivedDataOnce(t *testing.T) 
 	assertTableCount(t, db, usageprojection.EventTable, 0)
 	assertTableCount(t, db, projectionLegacy, 1)
 	var version string
-	if err := db.QueryRow(`select value from settings where key = ?`, usageMonitoringModelFormatVersionKey).Scan(&version); err != nil {
+	var formatUpdatedAt int64
+	if err := db.QueryRow(`select value, updated_at_ms from settings where key = ?`,
+		usageMonitoringModelFormatVersionKey).Scan(&version, &formatUpdatedAt); err != nil {
 		t.Fatalf("read monitoring model format version: %v", err)
 	}
 	if version != usageidentity.ModelFormatVersion {
@@ -1144,6 +1146,15 @@ func TestUsageMonitoringModelFormatUpgradeRebuildsDerivedDataOnce(t *testing.T) 
 		t.Fatalf("reopen upgraded sqlite: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	var reopenedFormatUpdatedAt int64
+	if err := db.QueryRow(`select updated_at_ms from settings where key = ?`,
+		usageMonitoringModelFormatVersionKey).Scan(&reopenedFormatUpdatedAt); err != nil {
+		t.Fatalf("read reopened monitoring model format timestamp: %v", err)
+	}
+	if reopenedFormatUpdatedAt != formatUpdatedAt {
+		t.Fatalf("monitoring model format timestamp changed on reopen: got %d, want %d",
+			reopenedFormatUpdatedAt, formatUpdatedAt)
+	}
 	assertTableCount(t, db, "usage_events", 1)
 	assertTableCount(t, db, usageMonitoringSelectorDailyTable, 1)
 	assertTableCount(t, db, usageMonitoringSelectorLegacy, 1)

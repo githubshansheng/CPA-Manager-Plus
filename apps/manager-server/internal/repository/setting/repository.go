@@ -8,7 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
+	sqldialect "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/security"
 )
 
@@ -36,14 +39,19 @@ type Repository interface {
 type repository struct {
 	db        *sql.DB
 	protector *security.Protector
+	dialect   sqldialect.Dialect
 }
 
 func New(db *sql.DB, protector ...*security.Protector) Repository {
+	return NewForBackend(db, database.BackendSQLite, protector...)
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind, protector ...*security.Protector) Repository {
 	var p *security.Protector
 	if len(protector) > 0 {
 		p = protector[0]
 	}
-	return &repository{db: db, protector: p}
+	return &repository{db: db, protector: p, dialect: sqldialect.ForBackend(backend)}
 }
 
 func (r *repository) SaveSetup(ctx context.Context, setup model.Setup) error {
@@ -51,11 +59,11 @@ func (r *repository) SaveSetup(ctx context.Context, setup model.Setup) error {
 	if err != nil {
 		return err
 	}
-	_, err = r.db.ExecContext(
+	_, err = outboxcontext.Exec(
 		ctx,
-		`insert into settings(key, value, updated_at_ms)
-		 values('setup', ?, ?)
-		 on conflict(key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+		r.db,
+		r.settingsUpsertSQL(),
+		"setup",
 		string(data),
 		time.Now().UnixMilli(),
 	)
@@ -73,7 +81,7 @@ func (r *repository) SaveManagerConfigAndSetup(ctx context.Context, cfg model.Ma
 		return err
 	}
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := outboxcontext.Begin(ctx, r.db, nil)
 	if err != nil {
 		return err
 	}
@@ -83,10 +91,10 @@ func (r *repository) SaveManagerConfigAndSetup(ctx context.Context, cfg model.Ma
 	if updatedAtMS == 0 {
 		updatedAtMS = time.Now().UnixMilli()
 	}
-	if err := upsertSetting(ctx, tx, managerConfigKey, cfgData, updatedAtMS); err != nil {
+	if err := r.upsertSetting(ctx, tx, managerConfigKey, cfgData, updatedAtMS); err != nil {
 		return err
 	}
-	if err := upsertSetting(ctx, tx, "setup", setupData, time.Now().UnixMilli()); err != nil {
+	if err := r.upsertSetting(ctx, tx, "setup", setupData, time.Now().UnixMilli()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -133,18 +141,18 @@ func (r *repository) NormalizeLegacyConnectionStorage(
 		}
 	}
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := outboxcontext.Begin(ctx, r.db, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 	if managerPresent {
-		if err := upsertSetting(ctx, tx, managerConfigKey, managerData, managerUpdatedAtMS); err != nil {
+		if err := r.upsertSetting(ctx, tx, managerConfigKey, managerData, managerUpdatedAtMS); err != nil {
 			return err
 		}
 	}
 	if setupPresent {
-		if err := upsertSetting(ctx, tx, "setup", setupData, time.Now().UnixMilli()); err != nil {
+		if err := r.upsertSetting(ctx, tx, "setup", setupData, time.Now().UnixMilli()); err != nil {
 			return err
 		}
 	}
@@ -153,7 +161,7 @@ func (r *repository) NormalizeLegacyConnectionStorage(
 
 func (r *repository) LoadSetup(ctx context.Context) (model.Setup, bool, error) {
 	var raw string
-	err := r.db.QueryRowContext(ctx, `select value from settings where key = 'setup'`).Scan(&raw)
+	err := r.db.QueryRowContext(ctx, "select `value` from settings where `key` = 'setup'").Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Setup{}, false, nil
 	}
@@ -177,19 +185,25 @@ func (r *repository) SaveManagerConfig(ctx context.Context, cfg model.ManagerCon
 	if err != nil {
 		return err
 	}
-	return upsertSetting(ctx, r.db, managerConfigKey, data, cfg.UpdatedAtMS)
+	_, err = outboxcontext.Exec(
+		ctx,
+		r.db,
+		r.settingsUpsertSQL(),
+		managerConfigKey,
+		string(data),
+		cfg.UpdatedAtMS,
+	)
+	return err
 }
 
 type settingWriter interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
-func upsertSetting(ctx context.Context, writer settingWriter, key string, data []byte, updatedAtMS int64) error {
+func (r *repository) upsertSetting(ctx context.Context, writer settingWriter, key string, data []byte, updatedAtMS int64) error {
 	_, err := writer.ExecContext(
 		ctx,
-		`insert into settings(key, value, updated_at_ms)
-		 values(?, ?, ?)
-		 on conflict(key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+		r.settingsUpsertSQL(),
 		key,
 		string(data),
 		updatedAtMS,
@@ -226,7 +240,7 @@ func (r *repository) marshalManagerConfig(cfg model.ManagerConfig) ([]byte, erro
 
 func (r *repository) LoadManagerConfig(ctx context.Context) (model.ManagerConfig, bool, error) {
 	var raw string
-	err := r.db.QueryRowContext(ctx, `select value from settings where key = ?`, managerConfigKey).Scan(&raw)
+	err := r.db.QueryRowContext(ctx, "select `value` from settings where `key` = ?", managerConfigKey).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.ManagerConfig{}, false, nil
 	}
@@ -250,11 +264,10 @@ func (r *repository) SaveAutomationSettings(ctx context.Context, settings model.
 	if err != nil {
 		return model.AutomationSettings{}, err
 	}
-	_, err = r.db.ExecContext(
+	_, err = outboxcontext.Exec(
 		ctx,
-		`insert into settings(key, value, updated_at_ms)
-		 values(?, ?, ?)
-		 on conflict(key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+		r.db,
+		r.settingsUpsertSQL(),
 		automationSettingsKey,
 		string(data),
 		settings.UpdatedAtMS,
@@ -267,7 +280,7 @@ func (r *repository) SaveAutomationSettings(ctx context.Context, settings model.
 
 func (r *repository) LoadAutomationSettings(ctx context.Context) (model.AutomationSettings, bool, error) {
 	var raw string
-	err := r.db.QueryRowContext(ctx, `select value from settings where key = ?`, automationSettingsKey).Scan(&raw)
+	err := r.db.QueryRowContext(ctx, "select `value` from settings where `key` = ?", automationSettingsKey).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.AutomationSettings{}, false, nil
 	}
@@ -289,11 +302,10 @@ func (r *repository) SaveAdminCredential(ctx context.Context, credential model.A
 	if err != nil {
 		return err
 	}
-	_, err = r.db.ExecContext(
+	_, err = outboxcontext.Exec(
 		ctx,
-		`insert into settings(key, value, updated_at_ms)
-		 values(?, ?, ?)
-		 on conflict(key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+		r.db,
+		r.settingsUpsertSQL(),
 		adminCredentialKey,
 		string(data),
 		time.Now().UnixMilli(),
@@ -303,7 +315,7 @@ func (r *repository) SaveAdminCredential(ctx context.Context, credential model.A
 
 func (r *repository) LoadAdminCredential(ctx context.Context) (model.AdminCredential, bool, error) {
 	var raw string
-	err := r.db.QueryRowContext(ctx, `select value from settings where key = ?`, adminCredentialKey).Scan(&raw)
+	err := r.db.QueryRowContext(ctx, "select `value` from settings where `key` = ?", adminCredentialKey).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.AdminCredential{}, false, nil
 	}
@@ -323,11 +335,10 @@ func (r *repository) SaveBootstrapState(ctx context.Context, state model.Bootstr
 	if err != nil {
 		return err
 	}
-	_, err = r.db.ExecContext(
+	_, err = outboxcontext.Exec(
 		ctx,
-		`insert into settings(key, value, updated_at_ms)
-		 values(?, ?, ?)
-		 on conflict(key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+		r.db,
+		r.settingsUpsertSQL(),
 		bootstrapStateKey,
 		string(data),
 		state.UpdatedAtMS,
@@ -337,7 +348,7 @@ func (r *repository) SaveBootstrapState(ctx context.Context, state model.Bootstr
 
 func (r *repository) LoadBootstrapState(ctx context.Context) (model.BootstrapState, bool, error) {
 	var raw string
-	err := r.db.QueryRowContext(ctx, `select value from settings where key = ?`, bootstrapStateKey).Scan(&raw)
+	err := r.db.QueryRowContext(ctx, "select `value` from settings where `key` = ?", bootstrapStateKey).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.BootstrapState{}, false, nil
 	}
@@ -365,12 +376,20 @@ func (r *repository) HasHistoricalData(ctx context.Context) (bool, error) {
 	var settingsCount int64
 	if err := r.db.QueryRowContext(
 		ctx,
-		`select count(*) from settings where key in ('setup', ?)`,
+		"select count(*) from settings where `key` in ('setup', ?)",
 		managerConfigKey,
 	).Scan(&settingsCount); err != nil {
 		return false, err
 	}
 	return settingsCount > 0, nil
+}
+
+func (r *repository) settingsUpsertSQL() string {
+	return "insert into settings(`key`, `value`, `updated_at_ms`) values(?, ?, ?)" +
+		r.dialect.UpsertClause(
+			[]string{"key"},
+			[]string{"value", "updated_at_ms"},
+		)
 }
 
 func (r *repository) protectSetup(setup model.Setup) (model.Setup, error) {

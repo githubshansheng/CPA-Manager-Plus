@@ -2,13 +2,13 @@ package usagemonitoring
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
 
-func upsertSelectorDailyBatch(ctx context.Context, tx *sql.Tx, afterID, throughID, nowMS int64) error {
+func upsertSelectorDailyBatch(ctx context.Context, tx *dialect.Tx, afterID, throughID, nowMS int64) error {
 	query := fmt.Sprintf(`insert into usage_monitoring_selector_daily_rollups_v1 (
 		model_format_revision, bucket_ms, model, api_key_hash, provider, auth_file_snapshot,
 		account_snapshot, auth_label_snapshot, auth_index, source, source_hash,

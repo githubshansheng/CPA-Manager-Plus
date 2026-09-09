@@ -2,9 +2,11 @@ package usageevent
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageprojection"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 )
@@ -146,7 +148,7 @@ func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit in
 		return 0, nil
 	}
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, sqlTx, err := r.beginBackfillTx(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -197,11 +199,17 @@ func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit in
 		return 0, nil
 	}
 	nowMS := time.Now().UnixMilli()
-	if err := usageprojection.UpsertEventIDs(ctx, tx, updatedIDs, nowMS); err != nil {
-		return 0, err
-	}
-	if err := usageprojection.UpsertHeaderIDs(ctx, tx, updatedIDs, nowMS); err != nil {
-		return 0, err
+	if r.isMySQL() {
+		if err := r.upsertMySQLProjectionIDs(ctx, sqlTx, updatedIDs, nowMS); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := usageprojection.UpsertEventIDs(ctx, sqlTx, updatedIDs, nowMS); err != nil {
+			return 0, err
+		}
+		if err := usageprojection.UpsertHeaderIDs(ctx, sqlTx, updatedIDs, nowMS); err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
@@ -209,8 +217,19 @@ func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit in
 	return len(updatedIDs), nil
 }
 
+func (r *repository) beginBackfillTx(ctx context.Context) (usageEventTx, *sql.Tx, error) {
+	if r.isMySQL() {
+		return r.beginMySQLWriteTx(ctx)
+	}
+	tx, err := outboxcontext.Begin(ctx, r.db, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tx, tx.Tx, nil
+}
+
 func (r *repository) responseMetadataBackfillPage(ctx context.Context, afterID int64, limit int) ([]responseMetadataBackfillRow, error) {
-	rows, err := r.db.QueryContext(ctx, responseMetadataBackfillSelect, afterID, limit)
+	rows, err := r.queryContext(ctx, responseMetadataBackfillSelect, afterID, limit)
 	if err != nil {
 		return nil, err
 	}

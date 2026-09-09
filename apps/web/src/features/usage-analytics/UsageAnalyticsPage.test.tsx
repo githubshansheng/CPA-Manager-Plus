@@ -776,6 +776,20 @@ describe('UsageAnalyticsPage', () => {
     expect(getText(renderer.root)).toContain('analytics failed');
   });
 
+  it('shows an actionable disabled state when the menu is visible but collection is off', () => {
+    mocks.usageState = createUsageState({
+      enabled: false,
+      unavailableReason: 'monitoring_disabled',
+    });
+
+    const renderer = renderPage();
+    const text = getText(renderer.root);
+
+    expect(text).toContain('monitoring.request_monitoring_disabled_title');
+    expect(text).toContain('monitoring.request_monitoring_disabled_body');
+    expect(text).not.toContain('usage_analytics.tab_overview');
+  });
+
   it('navigates to request monitoring details for a selected anomaly bucket', () => {
     mocks.usageState = createUsageState({
       filters: {

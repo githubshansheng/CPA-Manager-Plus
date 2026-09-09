@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageaggregate"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 )
@@ -114,17 +115,17 @@ func (r *repository) UsageCacheAccountingState(ctx context.Context) (State, bool
 }
 
 func (r *repository) DiscoverUsageCacheAccounting(ctx context.Context) (State, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := outboxcontext.Begin(ctx, r.db, nil)
 	if err != nil {
 		return State{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	state, err := stateInTx(ctx, tx)
+	state, err := stateInTx(ctx, tx.Tx)
 	if err != nil {
 		return State{}, err
 	}
-	semanticsChanged, err := reconcileSemanticsRevisionInTx(ctx, tx, &state)
+	semanticsChanged, err := reconcileSemanticsRevisionInTx(ctx, tx.Tx, &state)
 	if err != nil {
 		return State{}, err
 	}
@@ -225,13 +226,13 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 	if batchSize <= 0 {
 		batchSize = 1000
 	}
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := outboxcontext.Begin(ctx, r.db, nil)
 	if err != nil {
 		return BatchResult{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	state, err := stateInTx(ctx, tx)
+	state, err := stateInTx(ctx, tx.Tx)
 	if err != nil {
 		return BatchResult{}, err
 	}
@@ -243,7 +244,7 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 	case StatusFailed:
 		return BatchResult{}, errors.New("usage cache accounting migration failure must be resumed before running a batch")
 	case StatusApplying:
-		result, err := applyChangesBatchInTx(ctx, tx, state, batchSize)
+		result, err := applyChangesBatchInTx(ctx, tx.Tx, state, batchSize)
 		if err != nil {
 			return BatchResult{}, err
 		}
@@ -252,7 +253,7 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 		}
 		return result, nil
 	case StatusClearing:
-		result, err := clearDerivedBatchInTx(ctx, tx, state, batchSize)
+		result, err := clearDerivedBatchInTx(ctx, tx.Tx, state, batchSize)
 		if err != nil {
 			return BatchResult{}, err
 		}
@@ -266,7 +267,7 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 		return BatchResult{}, fmt.Errorf("invalid usage cache accounting migration status %q", state.Status)
 	}
 	if state.TargetEventID <= state.LastEventID {
-		result, err := finishScanInTx(ctx, tx, state)
+		result, err := finishScanInTx(ctx, tx.Tx, state)
 		if err != nil {
 			return BatchResult{}, err
 		}
@@ -276,13 +277,13 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 		return result, nil
 	}
 
-	rows, err := readCacheAccountingBatch(ctx, tx, state.LastEventID, state.TargetEventID, batchSize)
+	rows, err := readCacheAccountingBatch(ctx, tx.Tx, state.LastEventID, state.TargetEventID, batchSize)
 	if err != nil {
 		return BatchResult{}, err
 	}
 	if len(rows) == 0 {
 		state.LastEventID = state.TargetEventID
-		result, err := finishScanInTx(ctx, tx, state)
+		result, err := finishScanInTx(ctx, tx.Tx, state)
 		if err != nil {
 			return BatchResult{}, err
 		}
@@ -294,7 +295,7 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 
 	changedRows := int64(0)
 	for _, row := range rows {
-		changed, err := stageCacheAccountingRow(ctx, tx, row)
+		changed, err := stageCacheAccountingRow(ctx, tx.Tx, row)
 		if err != nil {
 			return BatchResult{}, err
 		}
@@ -312,7 +313,7 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 	state.UpdatedAtMS = nowMS
 	state.LastError = ""
 	if state.LastEventID >= state.TargetEventID {
-		result, err := finishScanInTx(ctx, tx, state)
+		result, err := finishScanInTx(ctx, tx.Tx, state)
 		if err != nil {
 			return BatchResult{}, err
 		}

@@ -296,7 +296,7 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (WriteResponse, e
 		}
 		writes[writeIndex].Observation.ObservationHash = observationHash(writes[writeIndex])
 	}
-	if err := s.store.QuotaSnapshots.InsertObservationWrites(ctx, writes); err != nil {
+	if err := s.store.InsertQuotaObservationWrites(ctx, writes); err != nil {
 		return WriteResponse{}, err
 	}
 	for _, write := range writes {
@@ -460,7 +460,7 @@ func (s *Service) stabilizeNewDerivedFixedBoundaries(
 		}
 	}
 	for key, locations := range grouped {
-		candidates, err := s.store.QuotaSnapshots.ListCandidates(
+		candidates, err := s.store.ListQuotaSnapshotCandidates(
 			ctx,
 			key.accountKey,
 			key.provider,
@@ -517,11 +517,11 @@ func (s *Service) Query(ctx context.Context, req QueryRequest) (QueryResponse, e
 		if !ok {
 			return QueryResponse{}, errors.New("account identity is required")
 		}
-		candidates, err := s.store.QuotaSnapshots.ListCandidates(ctx, accountKey, provider, maxSnapshotsPerQuery)
+		candidates, err := s.store.ListQuotaSnapshotCandidates(ctx, accountKey, provider, maxSnapshotsPerQuery)
 		if err != nil {
 			return QueryResponse{}, err
 		}
-		states, err := s.store.QuotaSnapshots.ListWindowStates(ctx, accountKey, provider)
+		states, err := s.store.ListQuotaWindowStates(ctx, accountKey, provider)
 		if err != nil {
 			return QueryResponse{}, err
 		}

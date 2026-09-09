@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -47,7 +48,7 @@ func TestRunStoresFreshConnectionEncryptedWithoutLeakingSecret(t *testing.T) {
 	}
 	if info, err := os.Stat(dataKeyPath); err != nil {
 		t.Fatalf("stat data key: %v", err)
-	} else if info.Mode().Perm() != 0o600 {
+	} else if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("data key mode = %o", info.Mode().Perm())
 	}
 

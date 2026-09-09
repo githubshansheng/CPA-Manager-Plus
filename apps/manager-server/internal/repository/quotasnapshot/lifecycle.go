@@ -8,9 +8,12 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/codexquota"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
 
@@ -46,27 +49,60 @@ func (r *repository) InsertObservationWrites(ctx context.Context, writes []model
 		return nil
 	}
 	sortObservationWrites(writes)
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	for attempt := 0; ; attempt++ {
+		err := r.insertObservationWritesOnce(ctx, writes)
+		if err == nil || attempt >= 3 || !r.dialect.IsRetryableWriteConflict(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 10 * time.Millisecond):
+		}
 	}
-	defer func() { _ = tx.Rollback() }()
-	if err := insertObservationWrites(ctx, tx, writes); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
-func insertObservationWrites(ctx context.Context, tx *sql.Tx, writes []model.AccountQuotaObservationWrite) error {
+func (r *repository) insertObservationWritesOnce(
+	ctx context.Context,
+	writes []model.AccountQuotaObservationWrite,
+) error {
+	var tx *sql.Tx
+	var commit, rollback func() error
+	if r.dialect.IsMySQL() {
+		mysqlTx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+		if err != nil {
+			return err
+		}
+		tx, commit, rollback = mysqlTx, mysqlTx.Commit, mysqlTx.Rollback
+	} else {
+		authorityTx, err := outboxcontext.Begin(ctx, r.db, nil)
+		if err != nil {
+			return err
+		}
+		tx, commit, rollback = authorityTx.Tx, authorityTx.Commit, authorityTx.Rollback
+	}
+	defer func() { _ = rollback() }()
+	if err := insertObservationWrites(ctx, tx, r.dialect, writes); err != nil {
+		return err
+	}
+	return commit()
+}
+
+func insertObservationWrites(
+	ctx context.Context,
+	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
+	writes []model.AccountQuotaObservationWrite,
+) error {
 	for writeIndex := range writes {
 		write := &writes[writeIndex]
 		write.InsertedSnapshotCount = 0
-		lifecycleApplied, err := observationAdvancesLifecycle(ctx, tx, write.Observation)
+		lifecycleApplied, err := observationAdvancesLifecycle(ctx, tx, sqlDialect, write.Observation)
 		if err != nil {
 			return err
 		}
 		write.Observation.LifecycleApplied = lifecycleApplied
-		observationID, inserted, err := insertObservation(ctx, tx, write.Observation)
+		observationID, inserted, err := insertObservation(ctx, tx, sqlDialect, write.Observation)
 		if err != nil {
 			return err
 		}
@@ -89,14 +125,19 @@ func insertObservationWrites(ctx context.Context, tx *sql.Tx, writes []model.Acc
 			write.Observation.LifecycleApplied = storedLifecycleApplied != 0
 		}
 		write.Observation.ID = observationID
-		if err := persistObservationSnapshots(ctx, tx, write); err != nil {
+		if err := persistObservationSnapshots(ctx, tx, sqlDialect, write); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func persistObservationSnapshots(ctx context.Context, tx *sql.Tx, write *model.AccountQuotaObservationWrite) error {
+func persistObservationSnapshots(
+	ctx context.Context,
+	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
+	write *model.AccountQuotaObservationWrite,
+) error {
 	observationID := write.Observation.ID
 	if !write.Observation.LifecycleApplied {
 		for snapshotIndex := range write.Snapshots {
@@ -125,10 +166,10 @@ func persistObservationSnapshots(ctx context.Context, tx *sql.Tx, write *model.A
 	for snapshotIndex := range write.Snapshots {
 		snapshot := &write.Snapshots[snapshotIndex]
 		snapshot.ObservationID = observationID
-		if err := reclassifyLegacyCodexAllScope(ctx, tx, write.Observation, snapshot); err != nil {
+		if err := reclassifyLegacyCodexAllScope(ctx, tx, sqlDialect, write.Observation, snapshot); err != nil {
 			return err
 		}
-		window, activationID, lifecycleOwned, err := reconcileReportedWindow(ctx, tx, write.Observation, snapshot)
+		window, activationID, lifecycleOwned, err := reconcileReportedWindow(ctx, tx, sqlDialect, write.Observation, snapshot)
 		if err != nil {
 			return err
 		}
@@ -144,7 +185,7 @@ func persistObservationSnapshots(ctx context.Context, tx *sql.Tx, write *model.A
 		}
 		snapshot.LogicalWindowID = window.id
 		snapshot.ActivationID = activationID
-		cycleID, closedCycleID, closedEarly, err := reconcileCycle(ctx, tx, activationID, observationID, snapshot)
+		cycleID, closedCycleID, closedEarly, err := reconcileCycle(ctx, tx, sqlDialect, activationID, observationID, snapshot)
 		if err != nil {
 			return err
 		}
@@ -170,12 +211,13 @@ func persistObservationSnapshots(ctx context.Context, tx *sql.Tx, write *model.A
 	if err := restoreCodexRelationships(ctx, tx, write.Observation); err != nil {
 		return err
 	}
-	if err := reconcileAbsentWindows(ctx, tx, observationID, write.Observation, reported, write.Removed); err != nil {
+	if err := reconcileAbsentWindows(ctx, tx, sqlDialect, observationID, write.Observation, reported, write.Removed); err != nil {
 		return err
 	}
 	if err := clearInactiveContainerRelationships(
 		ctx,
 		tx,
+		sqlDialect,
 		write.Observation.AccountKey,
 		write.Observation.Provider,
 		write.Observation.CreatedAtMS,
@@ -255,23 +297,29 @@ func observationAuthorityRank(observation model.AccountQuotaObservation) int {
 func observationAdvancesLifecycle(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	observation model.AccountQuotaObservation,
 ) (bool, error) {
-	var watermark sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `select max(observed_at_ms)
+	var watermark int64
+	err := tx.QueryRowContext(ctx, `select observed_at_ms
 		from account_quota_observations
 		where account_key = ? and provider = ? and inventory_scope_key = ?
-			and lifecycle_applied = 1`,
+			and lifecycle_applied = 1
+		order by observed_at_ms desc, id desc limit 1`+sqlDialect.ForUpdate(),
 		observation.AccountKey,
 		observation.Provider,
 		observation.InventoryScopeKey,
-	).Scan(&watermark); err != nil {
-		return false, err
-	}
-	if !watermark.Valid || observation.ObservedAtMS > watermark.Int64 {
+	).Scan(&watermark)
+	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}
-	if observation.ObservedAtMS < watermark.Int64 {
+	if err != nil {
+		return false, err
+	}
+	if observation.ObservedAtMS > watermark {
+		return true, nil
+	}
+	if observation.ObservedAtMS < watermark {
 		return false, nil
 	}
 
@@ -283,7 +331,7 @@ func observationAdvancesLifecycle(
 		observation.AccountKey,
 		observation.Provider,
 		observation.InventoryScopeKey,
-		watermark.Int64,
+		watermark,
 	)
 	if err != nil {
 		return false, err
@@ -293,7 +341,7 @@ func observationAdvancesLifecycle(
 	var highest model.AccountQuotaObservation
 	hasHighest := false
 	for rows.Next() {
-		candidate := model.AccountQuotaObservation{ObservedAtMS: watermark.Int64}
+		candidate := model.AccountQuotaObservation{ObservedAtMS: watermark}
 		if err := rows.Scan(
 			&candidate.InventoryMode,
 			&candidate.Source,
@@ -313,12 +361,35 @@ func observationAdvancesLifecycle(
 	return !hasHighest || compareObservationOrder(observation, highest) > 0, nil
 }
 
-func insertObservation(ctx context.Context, tx *sql.Tx, observation model.AccountQuotaObservation) (int64, bool, error) {
-	result, err := tx.ExecContext(ctx, `insert or ignore into account_quota_observations (
+func insertObservation(
+	ctx context.Context,
+	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
+	observation model.AccountQuotaObservation,
+) (int64, bool, error) {
+	if sqlDialect.IsMySQL() {
+		var existingID int64
+		err := tx.QueryRowContext(ctx, `select id from account_quota_observations
+			where observation_hash = ? limit 1 for update`, observation.ObservationHash).Scan(&existingID)
+		if err == nil {
+			return existingID, false, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, false, err
+		}
+	}
+	query := `insert or ignore into account_quota_observations (
 		observation_hash, account_key, provider, source, source_observation_id,
 		inventory_scope_key, inventory_mode, observed_at_ms, window_count,
 		lifecycle_applied, created_at_ms
-	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	if sqlDialect.IsMySQL() {
+		// A strict INSERT preserves every validation error. A concurrent first
+		// insert is retried at the outer transaction boundary and then follows the
+		// locked existing-row branch above.
+		query = strings.Replace(query, "insert or ignore", "insert", 1)
+	}
+	result, err := tx.ExecContext(ctx, query,
 		observation.ObservationHash,
 		observation.AccountKey,
 		observation.Provider,
@@ -362,10 +433,11 @@ func boolInteger(value bool) int {
 func reconcileReportedWindow(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	observation model.AccountQuotaObservation,
 	snapshot *model.AccountQuotaSnapshot,
 ) (logicalWindowRow, int64, bool, error) {
-	window, err := findLogicalWindow(ctx, tx, snapshot.AccountKey, snapshot.Provider, snapshot.ProviderWindowID, snapshot.ScopeFingerprint)
+	window, err := findLogicalWindow(ctx, tx, sqlDialect, snapshot.AccountKey, snapshot.Provider, snapshot.ProviderWindowID, snapshot.ScopeFingerprint)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return logicalWindowRow{}, 0, false, err
 	}
@@ -488,7 +560,7 @@ func reconcileReportedWindow(
 		window.containerProviderWindowID = snapshot.ContainerWindowID
 	}
 
-	activationID, err := activeActivationID(ctx, tx, window.id)
+	activationID, err := activeActivationID(ctx, tx, sqlDialect, window.id)
 	if errors.Is(err, sql.ErrNoRows) {
 		result, insertErr := tx.ExecContext(ctx, `insert into account_quota_window_activations (
 			window_id, generation, status, activated_at_ms, activation_accuracy,
@@ -518,6 +590,7 @@ func reconcileReportedWindow(
 func reclassifyLegacyCodexAllScope(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	observation model.AccountQuotaObservation,
 	snapshot *model.AccountQuotaSnapshot,
 ) error {
@@ -624,6 +697,7 @@ func reclassifyLegacyCodexAllScope(
 				if err := deactivateWindowWithReason(
 					ctx,
 					tx,
+					sqlDialect,
 					window,
 					observation.ID,
 					observation.ObservedAtMS,
@@ -643,6 +717,7 @@ func reclassifyLegacyCodexAllScope(
 		if err := deactivateWindowWithReason(
 			ctx,
 			tx,
+			sqlDialect,
 			window,
 			observation.ID,
 			observation.ObservedAtMS,
@@ -721,18 +796,18 @@ func restoreSameTimestampDeltaRemovalsForCompleteObservation(
 		return false, nil
 	}
 	rows, err := tx.QueryContext(ctx, `select
-		window.id, window.provider_window_id, window.scope_fingerprint, window.inventory_scope_key,
-		window.availability, window.generation, window.absence_count,
-		window.first_seen_at_ms, window.last_seen_at_ms,
-		window.missing_since_ms, window.deactivated_at_ms,
-		coalesce(window.relationship_kind, ''), coalesce(window.container_provider_window_id, '')
-		from account_quota_windows window
+		quota_window.id, quota_window.provider_window_id, quota_window.scope_fingerprint, quota_window.inventory_scope_key,
+		quota_window.availability, quota_window.generation, quota_window.absence_count,
+		quota_window.first_seen_at_ms, quota_window.last_seen_at_ms,
+		quota_window.missing_since_ms, quota_window.deactivated_at_ms,
+		coalesce(quota_window.relationship_kind, ''), coalesce(quota_window.container_provider_window_id, '')
+		from account_quota_windows quota_window
 		join account_quota_window_activations activation
-			on activation.window_id = window.id and activation.generation = window.generation
+			on activation.window_id = quota_window.id and activation.generation = quota_window.generation
 		join account_quota_observations removal
 			on removal.id = activation.deactivate_observation_id
-		where window.account_key = ? and window.provider = ?
-			and window.inventory_scope_key = ? and window.availability = 'inactive'
+		where quota_window.account_key = ? and quota_window.provider = ?
+			and quota_window.inventory_scope_key = ? and quota_window.availability = 'inactive'
 			and activation.deactivated_at_ms is not null
 			and removal.inventory_mode = 'delta' and removal.observed_at_ms = ?`,
 		observation.AccountKey,
@@ -1000,11 +1075,12 @@ func resolveWindowRelationship(
 func reconcileCycle(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	activationID int64,
 	observationID int64,
 	snapshot *model.AccountQuotaSnapshot,
 ) (cycleID, closedCycleID int64, closedEarly bool, err error) {
-	active, activeErr := activeCycle(ctx, tx, activationID)
+	active, activeErr := activeCycleForUpdate(ctx, tx, sqlDialect, activationID)
 	if activeErr != nil && !errors.Is(activeErr, sql.ErrNoRows) {
 		return 0, 0, false, activeErr
 	}
@@ -1052,9 +1128,9 @@ func reconcileCycle(
 			}
 			var id int64
 			if nearScheduledRollover {
-				id, err = restoreOrInsertCycleAt(ctx, tx, activationID, observationID, &actualEndMS, snapshot)
+				id, err = restoreOrInsertCycleAt(ctx, tx, sqlDialect, activationID, observationID, &actualEndMS, snapshot)
 			} else {
-				id, err = restoreOrInsertCycle(ctx, tx, activationID, observationID, snapshot)
+				id, err = restoreOrInsertCycle(ctx, tx, sqlDialect, activationID, observationID, snapshot)
 			}
 			return id, active.ID, false, err
 		}
@@ -1069,7 +1145,7 @@ func reconcileCycle(
 		return 0, 0, false, nil
 	}
 	if errors.Is(activeErr, sql.ErrNoRows) {
-		id, restoreErr := restoreOrInsertCycle(ctx, tx, activationID, observationID, snapshot)
+		id, restoreErr := restoreOrInsertCycle(ctx, tx, sqlDialect, activationID, observationID, snapshot)
 		return id, 0, false, restoreErr
 	}
 	// Canonicalization below replaces stale timing geometry with the active
@@ -1439,20 +1515,22 @@ func boundaryAccuracyValue(value string) int {
 func restoreOrInsertCycle(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	activationID, observationID int64,
 	snapshot *model.AccountQuotaSnapshot,
 ) (int64, error) {
-	return restoreOrInsertCycleAt(ctx, tx, activationID, observationID, nil, snapshot)
+	return restoreOrInsertCycleAt(ctx, tx, sqlDialect, activationID, observationID, nil, snapshot)
 }
 
 func restoreOrInsertCycleAt(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	activationID, observationID int64,
 	actualStartMS *int64,
 	snapshot *model.AccountQuotaSnapshot,
 ) (int64, error) {
-	closed, err := matchingClosedCycle(ctx, tx, activationID, *snapshot)
+	closed, err := matchingClosedCycle(ctx, tx, sqlDialect, activationID, *snapshot)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
@@ -1498,6 +1576,7 @@ func restoreOrInsertCycleAt(
 func matchingClosedCycle(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	activationID int64,
 	snapshot model.AccountQuotaSnapshot,
 ) (model.AccountQuotaCycle, error) {
@@ -1516,7 +1595,7 @@ func matchingClosedCycle(
 		)
 		order by case when provider_cycle_key = ? then 0 else 1 end,
 			case boundary_accuracy when 'exact' then 0 when 'derived' then 1 else 2 end,
-			actual_end_ms desc, id desc limit 1`,
+			actual_end_ms desc, id desc limit 1`+sqlDialect.ForUpdate(),
 		activationID,
 		cycleKey,
 		snapshot.DurationSeconds,
@@ -1593,13 +1672,14 @@ func insertCycleWithKey(
 func reconcileAbsentWindows(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	observationID int64,
 	observation model.AccountQuotaObservation,
 	reported map[string]struct{},
 	removed []model.AccountQuotaWindowRemoval,
 ) error {
 	for _, item := range removed {
-		window, err := findLogicalWindow(ctx, tx, observation.AccountKey, observation.Provider, item.ProviderWindowID, item.ScopeFingerprint)
+		window, err := findLogicalWindow(ctx, tx, sqlDialect, observation.AccountKey, observation.Provider, item.ProviderWindowID, item.ScopeFingerprint)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -1612,7 +1692,7 @@ func reconcileAbsentWindows(
 		if window.availability == "inactive" {
 			continue
 		}
-		if err := deactivateWindow(ctx, tx, window, observationID, observation.ObservedAtMS, observation.CreatedAtMS); err != nil {
+		if err := deactivateWindow(ctx, tx, sqlDialect, window, observationID, observation.ObservedAtMS, observation.CreatedAtMS); err != nil {
 			return err
 		}
 	}
@@ -1656,7 +1736,7 @@ func reconcileAbsentWindows(
 			if window.missingSinceMS.Valid && observation.ObservedAtMS <= window.missingSinceMS.Int64 {
 				continue
 			}
-			if err := deactivateWindow(ctx, tx, window, observationID, observation.ObservedAtMS, observation.CreatedAtMS); err != nil {
+			if err := deactivateWindow(ctx, tx, sqlDialect, window, observationID, observation.ObservedAtMS, observation.CreatedAtMS); err != nil {
 				return err
 			}
 			continue
@@ -1674,12 +1754,14 @@ func reconcileAbsentWindows(
 func deactivateWindow(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	window logicalWindowRow,
 	observationID, observedAtMS, updatedAtMS int64,
 ) error {
 	return deactivateWindowWithReason(
 		ctx,
 		tx,
+		sqlDialect,
 		window,
 		observationID,
 		observedAtMS,
@@ -1693,6 +1775,7 @@ func deactivateWindow(
 func deactivateWindowWithReason(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	window logicalWindowRow,
 	observationID, observedAtMS, updatedAtMS int64,
 	activationReason, cycleReason string,
@@ -1708,7 +1791,7 @@ func deactivateWindowWithReason(
 		transitionMS, observationID, updatedAtMS, window.id); err != nil {
 		return err
 	}
-	activationID, err := activeActivationID(ctx, tx, window.id)
+	activationID, err := activeActivationID(ctx, tx, sqlDialect, window.id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -1721,7 +1804,7 @@ func deactivateWindowWithReason(
 		transitionMS, activationReason, observationID, updatedAtMS, activationID); err != nil {
 		return err
 	}
-	active, err := activeCycle(ctx, tx, activationID)
+	active, err := activeCycleForUpdate(ctx, tx, sqlDialect, activationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -1742,6 +1825,7 @@ func deactivateWindowWithReason(
 func clearInactiveContainerRelationships(
 	ctx context.Context,
 	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
 	accountKey, provider string,
 	updatedAtMS int64,
 ) error {
@@ -1763,6 +1847,22 @@ func clearInactiveContainerRelationships(
 				and coalesce(trim(child.container_provider_window_id), '') <> ''
 				and parent.availability = 'inactive'
 		)`, updatedAtMS, accountKey, provider); err != nil {
+		return err
+	}
+	if sqlDialect.IsMySQL() {
+		_, err := tx.ExecContext(ctx, `update account_quota_windows child
+			join account_quota_windows parent
+				on parent.account_key = child.account_key
+				and parent.provider = child.provider
+				and parent.provider_window_id = child.container_provider_window_id
+				and parent.scope_fingerprint = child.scope_fingerprint
+				and parent.inventory_scope_key = child.inventory_scope_key
+			set child.relationship_kind = null, child.container_provider_window_id = null,
+				child.updated_at_ms = ?
+			where child.account_key = ? and child.provider = ?
+				and coalesce(trim(child.relationship_kind), '') <> ''
+				and coalesce(trim(child.container_provider_window_id), '') <> ''
+				and parent.availability = 'inactive'`, updatedAtMS, accountKey, provider)
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `update account_quota_windows
@@ -1855,7 +1955,12 @@ func persistSnapshot(ctx context.Context, tx *sql.Tx, snapshot model.AccountQuot
 	return nil
 }
 
-func findLogicalWindow(ctx context.Context, tx *sql.Tx, accountKey, provider, providerWindowID, scopeFingerprint string) (logicalWindowRow, error) {
+func findLogicalWindow(
+	ctx context.Context,
+	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
+	accountKey, provider, providerWindowID, scopeFingerprint string,
+) (logicalWindowRow, error) {
 	var window logicalWindowRow
 	err := tx.QueryRowContext(ctx, `select
 		id, provider_window_id, window_kind, window_mode, scope_fingerprint, inventory_scope_key,
@@ -1863,7 +1968,7 @@ func findLogicalWindow(ctx context.Context, tx *sql.Tx, accountKey, provider, pr
 		missing_since_ms, deactivated_at_ms,
 		coalesce(relationship_kind, ''), coalesce(container_provider_window_id, '')
 		from account_quota_windows
-		where account_key = ? and provider = ? and provider_window_id = ? and scope_fingerprint = ?`,
+		where account_key = ? and provider = ? and provider_window_id = ? and scope_fingerprint = ?`+sqlDialect.ForUpdate(),
 		accountKey, provider, providerWindowID, scopeFingerprint,
 	).Scan(
 		&window.id, &window.providerWindowID, &window.windowKind, &window.windowMode,
@@ -1876,23 +1981,43 @@ func findLogicalWindow(ctx context.Context, tx *sql.Tx, accountKey, provider, pr
 	return window, err
 }
 
-func activeActivationID(ctx context.Context, tx *sql.Tx, windowID int64) (int64, error) {
+func activeActivationID(
+	ctx context.Context,
+	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
+	windowID int64,
+) (int64, error) {
 	var id int64
 	err := tx.QueryRowContext(ctx, `select id from account_quota_window_activations
-		where window_id = ? and deactivated_at_ms is null order by generation desc limit 1`, windowID).Scan(&id)
+		where window_id = ? and deactivated_at_ms is null order by generation desc limit 1`+sqlDialect.ForUpdate(), windowID).Scan(&id)
 	return id, err
 }
 
 func activeCycle(ctx context.Context, queryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, activationID int64) (model.AccountQuotaCycle, error) {
+	return activeCycleWithSuffix(ctx, queryer, activationID, "")
+}
+
+func activeCycleForUpdate(
+	ctx context.Context,
+	tx *sql.Tx,
+	sqlDialect dialect.Dialect,
+	activationID int64,
+) (model.AccountQuotaCycle, error) {
+	return activeCycleWithSuffix(ctx, tx, activationID, sqlDialect.ForUpdate())
+}
+
+func activeCycleWithSuffix(ctx context.Context, queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, activationID int64, suffix string) (model.AccountQuotaCycle, error) {
 	return scanCycle(queryer.QueryRowContext(ctx, `select
 		id, activation_id, provider_cycle_key, state, scheduled_start_ms, scheduled_end_ms,
 		actual_start_ms, actual_end_ms, duration_seconds, boundary_accuracy,
 		coalesce(end_reason, ''), first_observation_id, last_observation_id, parent_cycle_id,
 		created_at_ms, updated_at_ms
 		from account_quota_cycles where activation_id = ? and actual_end_ms is null
-		order by actual_start_ms desc limit 1`, activationID))
+		order by actual_start_ms desc limit 1`+suffix, activationID))
 }
 
 func scanCycle(row *sql.Row) (model.AccountQuotaCycle, error) {
@@ -2327,13 +2452,13 @@ func cycleHasOnlyProvisionalZeroAPIBoundaries(ctx context.Context, db *sql.DB, c
 			and abs(cycle_start_ms - observed_at_ms) <= ?
 		), 0) = 0 limit 1),
 		exists(select 1
-			from account_quota_cycles current
-			join account_quota_cycles previous
-				on previous.activation_id = current.activation_id
-				and previous.actual_start_ms < current.actual_start_ms
-			where current.id = ? and previous.end_reason = 'scheduled'
-				and previous.actual_end_ms is not null
-				and abs(previous.actual_end_ms - current.actual_start_ms) <= ?
+			from account_quota_cycles current_cycle
+			join account_quota_cycles previous_cycle
+				on previous_cycle.activation_id = current_cycle.activation_id
+				and previous_cycle.actual_start_ms < current_cycle.actual_start_ms
+			where current_cycle.id = ? and previous_cycle.end_reason = 'scheduled'
+				and previous_cycle.actual_end_ms is not null
+				and abs(previous_cycle.actual_end_ms - current_cycle.actual_start_ms) <= ?
 			limit 1)`,
 		cycleID,
 		cycleID,

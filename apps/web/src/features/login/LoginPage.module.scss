@@ -414,6 +414,154 @@
   }
 }
 
+.modeFieldset {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+
+  legend {
+    width: 100%;
+    margin-bottom: 14px;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.55;
+  }
+
+  @media (max-width: $breakpoint-mobile) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.modeOption {
+  position: relative;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  min-height: 136px;
+  padding: 18px;
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-md);
+  background: var(--app-surface-muted);
+  cursor: pointer;
+  transition:
+    border-color $transition-fast,
+    background-color $transition-fast,
+    transform $transition-fast;
+
+  input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  &:hover {
+    border-color: color-mix(in srgb, var(--primary-color) 46%, var(--app-border));
+    transform: translateY(-1px);
+  }
+
+  &:focus-within {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 3px;
+  }
+}
+
+.modeOptionSelected {
+  border-color: var(--primary-color);
+  background: color-mix(in srgb, var(--primary-color) 8%, var(--app-surface-muted));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary-color) 22%, transparent);
+}
+
+.modeIcon {
+  display: inline-grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  background: var(--app-accent-soft);
+  color: var(--primary-color);
+}
+
+.modeCopy {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+
+  strong {
+    color: var(--text-primary);
+    font-size: 15px;
+    line-height: 1.35;
+  }
+
+  small {
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+}
+
+.warningBox {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, #e6a23c 48%, var(--app-border));
+  border-radius: var(--app-radius-md);
+  background: color-mix(in srgb, #e6a23c 10%, var(--app-surface-muted));
+  color: color-mix(in srgb, #b66a08 88%, var(--text-primary));
+
+  svg {
+    margin-top: 1px;
+  }
+
+  strong {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--text-primary);
+    font-size: 14px;
+  }
+
+  p {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.6;
+  }
+}
+
+.preflightSummary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, #22a06b 40%, var(--app-border));
+  border-radius: var(--app-radius-sm);
+  background: color-mix(in srgb, #22a06b 8%, var(--app-surface-muted));
+
+  div {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: #18875a;
+  }
+
+  strong,
+  span {
+    font-size: 13px;
+  }
+
+  span {
+    color: var(--text-secondary);
+  }
+}
+
 .reviewGrid {
   display: grid;
   gap: 0;
@@ -513,6 +661,86 @@
   color: $error-color;
   font-size: 13px;
   line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.confirmationContent {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.confirmationHint {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.adoptionSourceSummary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 13px 15px;
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-sm);
+  background: var(--app-surface-muted);
+
+  span {
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  strong {
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+}
+
+.adoptionComplete {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 18px;
+}
+
+.adoptionCompleteIcon {
+  display: inline-grid;
+  place-items: center;
+  align-self: center;
+  width: 62px;
+  height: 62px;
+  border-radius: 50%;
+  background: color-mix(in srgb, #22a06b 13%, var(--app-surface-muted));
+  color: #18875a;
+}
+
+.adoptionCompleteCopy {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+
+  h2,
+  p {
+    margin: 0;
+  }
+
+  h2 {
+    color: var(--text-primary);
+    font-size: 23px;
+  }
+
+  p {
+    max-width: 48ch;
+    color: var(--text-secondary);
+    font-size: 14px;
+    line-height: 1.65;
+  }
 }
 
 @keyframes cardEnter {

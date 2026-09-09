@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageevent"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageprojection"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
@@ -67,21 +70,50 @@ type CatchUpResult struct {
 
 type repository struct {
 	db          *sql.DB
+	dialect     dialect.Dialect
 	catchUpGate chan struct{}
 }
 
 func New(db *sql.DB) Repository {
-	return &repository{db: db, catchUpGate: make(chan struct{}, 1)}
+	return NewSQLite(db)
+}
+
+func NewSQLite(db *sql.DB) Repository {
+	return newForBackend(db, database.BackendSQLite)
+}
+
+func NewMySQL(db *sql.DB) (Repository, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := dialect.ValidateMySQLSession(ctx, db); err != nil {
+		return nil, fmt.Errorf("validate usage monitoring mysql session: %w", err)
+	}
+	return newForBackend(db, database.BackendMySQL), nil
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return newForBackend(db, backend)
+}
+
+func newForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return &repository{
+		db:          db,
+		dialect:     dialect.ForBackend(backend),
+		catchUpGate: make(chan struct{}, 1),
+	}
 }
 
 func (r *repository) CatchUpProjection(ctx context.Context, limit int, nowMS int64) (CatchUpResult, error) {
-	return r.catchUp(ctx, ProjectionRollupName, limit, nowMS, func(ctx context.Context, tx *sql.Tx, _ string, afterID, throughID, updatedAtMS int64) error {
-		return usageprojection.UpsertEventRange(ctx, tx, afterID, throughID, updatedAtMS)
+	return r.catchUp(ctx, ProjectionRollupName, limit, nowMS, func(ctx context.Context, tx *dialect.Tx, _ string, afterID, throughID, updatedAtMS int64) error {
+		if tx.IsMySQL() {
+			return upsertMySQLEventProjectionRange(ctx, tx, afterID, throughID, updatedAtMS)
+		}
+		return usageprojection.UpsertEventRange(ctx, tx.Raw(), afterID, throughID, updatedAtMS)
 	})
 }
 
 func (r *repository) CatchUpStats(ctx context.Context, limit int, nowMS int64) (CatchUpResult, error) {
-	return r.catchUp(ctx, StatsRollupName, limit, nowMS, func(ctx context.Context, tx *sql.Tx, revision string, afterID, throughID, updatedAtMS int64) error {
+	return r.catchUp(ctx, StatsRollupName, limit, nowMS, func(ctx context.Context, tx *dialect.Tx, revision string, afterID, throughID, updatedAtMS int64) error {
 		if err := upsertAccountDailyBatch(ctx, tx, revision, afterID, throughID, updatedAtMS); err != nil {
 			return err
 		}
@@ -90,11 +122,14 @@ func (r *repository) CatchUpStats(ctx context.Context, limit int, nowMS int64) (
 }
 
 func (r *repository) CatchUpMetadata(ctx context.Context, limit int, nowMS int64) (CatchUpResult, error) {
-	return r.catchUp(ctx, MetadataRollupName, limit, nowMS, func(ctx context.Context, tx *sql.Tx, _ string, afterID, throughID, updatedAtMS int64) error {
+	return r.catchUp(ctx, MetadataRollupName, limit, nowMS, func(ctx context.Context, tx *dialect.Tx, _ string, afterID, throughID, updatedAtMS int64) error {
 		if err := upsertSelectorDailyBatch(ctx, tx, afterID, throughID, updatedAtMS); err != nil {
 			return err
 		}
-		return usageprojection.UpsertHeaderRange(ctx, tx, afterID, throughID, updatedAtMS)
+		if tx.IsMySQL() {
+			return upsertMySQLHeaderProjectionRange(ctx, tx, afterID, throughID, updatedAtMS)
+		}
+		return usageprojection.UpsertHeaderRange(ctx, tx.Raw(), afterID, throughID, updatedAtMS)
 	})
 }
 
@@ -102,12 +137,12 @@ func (r *repository) CatchUpCodexLegacyIdentityEvidence(ctx context.Context, lim
 	if limit <= 0 || limit > defaultBatchLimit {
 		limit = defaultBatchLimit
 	}
-	return r.catchUp(ctx, usageevent.CodexLegacyIdentityRollupName, limit, nowMS, func(ctx context.Context, tx *sql.Tx, revision string, afterID, throughID, _ int64) error {
+	return r.catchUp(ctx, usageevent.CodexLegacyIdentityRollupName, limit, nowMS, func(ctx context.Context, tx *dialect.Tx, revision string, afterID, throughID, _ int64) error {
 		return usageevent.UpsertCodexLegacyIdentityEvidenceRange(ctx, tx, revision, afterID, throughID)
 	})
 }
 
-type batchUpserter func(context.Context, *sql.Tx, string, int64, int64, int64) error
+type batchUpserter func(context.Context, *dialect.Tx, string, int64, int64, int64) error
 
 func (r *repository) catchUp(
 	ctx context.Context,
@@ -127,11 +162,17 @@ func (r *repository) catchUp(
 	}
 	defer r.releaseCatchUp()
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	rawTx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return CatchUpResult{}, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
+	if rollupName == usageevent.CodexLegacyIdentityRollupName {
+		if err := r.ensureCodexLegacyIdentityState(ctx, tx); err != nil {
+			return CatchUpResult{}, err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `update usage_monitoring_rollup_state set
 		last_run_started_at_ms = ? where rollup_name = ?`, nowMS, rollupName); err != nil {
 		return CatchUpResult{}, err
@@ -373,7 +414,7 @@ func stateQuery(ctx context.Context, db stateQuerier, rollupName string) (State,
 	return state, nil
 }
 
-func latestEventID(ctx context.Context, tx *sql.Tx) (int64, error) {
+func latestEventID(ctx context.Context, tx *dialect.Tx) (int64, error) {
 	var id int64
 	if err := tx.QueryRowContext(ctx, `select coalesce(max(id), 0) from usage_events`).Scan(&id); err != nil {
 		return 0, err
@@ -381,7 +422,7 @@ func latestEventID(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return id, nil
 }
 
-func eventIDsThrough(ctx context.Context, tx *sql.Tx, afterID, throughID int64, limit int) ([]int64, error) {
+func eventIDsThrough(ctx context.Context, tx *dialect.Tx, afterID, throughID int64, limit int) ([]int64, error) {
 	if throughID <= afterID {
 		return []int64{}, nil
 	}
@@ -402,7 +443,18 @@ func eventIDsThrough(ctx context.Context, tx *sql.Tx, afterID, throughID int64, 
 	return ids, rows.Err()
 }
 
-func resetForRevision(ctx context.Context, tx *sql.Tx, rollupName, revision string, latestID, nowMS int64) error {
+func (r *repository) ensureCodexLegacyIdentityState(ctx context.Context, tx *dialect.Tx) error {
+	query := `insert into usage_monitoring_rollup_state (
+		rollup_name, schema_version, structure_revision, status,
+		target_event_id, updated_at_ms
+	) values (?, ?, '', 'pending', 0, 0)` + r.dialect.InsertDoNothingClause(
+		[]string{"rollup_name"}, "rollup_name",
+	)
+	_, err := tx.ExecContext(ctx, query, usageevent.CodexLegacyIdentityRollupName, SchemaVersion)
+	return err
+}
+
+func resetForRevision(ctx context.Context, tx *dialect.Tx, rollupName, revision string, latestID, nowMS int64) error {
 	if _, err := tx.ExecContext(ctx, `update usage_monitoring_rollup_state set
 		structure_revision = ?, status = ?,
 		backfill_last_event_id = 0, coverage_event_id = 0,
@@ -426,16 +478,20 @@ func revisionResetStatus(rollupName string) string {
 	return "rebuilding"
 }
 
-func clearStatsRevisionRowsBatch(ctx context.Context, tx *sql.Tx, revision string, limit int) (bool, error) {
+func clearStatsRevisionRowsBatch(ctx context.Context, tx *dialect.Tx, revision string, limit int) (bool, error) {
 	remaining := limit
 	for _, tableName := range []string{
 		"usage_monitoring_account_daily_rollups_v1",
 		"usage_monitoring_api_key_daily_rollups_v1",
 	} {
 		if remaining > 0 {
-			result, err := tx.ExecContext(ctx, `delete from `+tableName+` where rowid in (
-				select rowid from `+tableName+` where structure_revision = ? limit ?
-			)`, revision, remaining)
+			deleteQuery := `delete from ` + tableName + ` where rowid in (
+				select rowid from ` + tableName + ` where structure_revision = ? limit ?
+			)`
+			if tx.IsMySQL() {
+				deleteQuery = "delete from " + tableName + " where structure_revision = ? limit ?"
+			}
+			result, err := tx.ExecContext(ctx, deleteQuery, revision, remaining)
 			if err != nil {
 				return false, fmt.Errorf("clear stats revision rows %s: %w", tableName, err)
 			}
@@ -458,7 +514,7 @@ func clearStatsRevisionRowsBatch(ctx context.Context, tx *sql.Tx, revision strin
 	return false, nil
 }
 
-func setSearchIndexReady(ctx context.Context, tx *sql.Tx, rollupName string, ready bool, nowMS int64) error {
+func setSearchIndexReady(ctx context.Context, tx *dialect.Tx, rollupName string, ready bool, nowMS int64) error {
 	if rollupName != ProjectionRollupName {
 		return nil
 	}

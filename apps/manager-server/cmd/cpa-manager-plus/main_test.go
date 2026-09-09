@@ -5,18 +5,21 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/config"
 	sqliterepo "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/sqlite"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageprojection"
 )
@@ -124,6 +127,98 @@ func TestServeHTTPServerCancelsRuntimeOnUnexpectedExit(t *testing.T) {
 	}
 }
 
+func TestRestartCoordinatorAcceptsOneRequestAndWakesRuntime(t *testing.T) {
+	restart := newRestartCoordinator()
+	if !restart.RequestRestart() {
+		t.Fatal("first restart request was rejected")
+	}
+	if restart.RequestRestart() {
+		t.Fatal("duplicate restart request was accepted")
+	}
+	select {
+	case <-restart.Requested():
+	case <-time.After(time.Second):
+		t.Fatal("accepted restart did not wake the runtime")
+	}
+}
+
+func TestServerIterationErrorPreservesRollbackStageAndCause(t *testing.T) {
+	cause := errors.New("database is locked by another process")
+	err := failServerIteration("acquire SQLite process lock", cause)
+	stage, detail := serverIterationErrorDetails(err)
+	if stage != "acquire SQLite process lock" || detail != cause.Error() || !errors.Is(err, cause) {
+		t.Fatalf("stage=%q detail=%q error=%v", stage, detail, err)
+	}
+}
+
+func TestValidateSelectedSQLiteSourceFilesRejectsDisappearedDatabaseAndDataKey(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		createDatabase bool
+		selectDataKey  bool
+		createDataKey  bool
+		wantErrorPart  string
+	}{
+		{
+			name:          "database disappeared",
+			wantErrorPart: "selected SQLite database",
+		},
+		{
+			name:           "selected data key disappeared",
+			createDatabase: true,
+			selectDataKey:  true,
+			wantErrorPart:  "selected SQLite data key",
+		},
+		{
+			name:           "selected files still exist",
+			createDatabase: true,
+			selectDataKey:  true,
+			createDataKey:  true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			databasePath := filepath.Join(t.TempDir(), "source.sqlite")
+			dataKeyPath := filepath.Join(t.TempDir(), "data.key")
+			if test.createDatabase {
+				if err := os.WriteFile(databasePath, []byte("SQLite format 3\x00"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			selection := config.SQLiteSourceSelection{
+				State:        config.SQLiteSourceStatePending,
+				Operation:    config.SQLiteSourceOperationSwitch,
+				DatabasePath: databasePath,
+			}
+			if test.selectDataKey {
+				selection.DataKeyPath = dataKeyPath
+			}
+			if test.createDataKey {
+				if err := os.WriteFile(dataKeyPath, []byte("existing-data-key"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := config.SaveSQLiteSourceSelection(dataDir, selection); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Config{
+				DBPath:            databasePath,
+				SQLiteSourceState: config.SQLiteSourceStatePending,
+			}
+			err := validateSelectedSQLiteSourceFiles(cfg, dataDir)
+			if test.wantErrorPart == "" {
+				if err != nil {
+					t.Fatalf("validateSelectedSQLiteSourceFiles() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErrorPart) {
+				t.Fatalf("validateSelectedSQLiteSourceFiles() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestDerivedMigrationsStartAfterHTTPListenerIsBound(t *testing.T) {
 	content, err := os.ReadFile("main.go")
 	if err != nil {
@@ -132,27 +227,34 @@ func TestDerivedMigrationsStartAfterHTTPListenerIsBound(t *testing.T) {
 	source := string(content)
 	listenAt := strings.Index(source, `net.Listen("tcp", cfg.HTTPAddr)`)
 	listeningLogAt := strings.Index(source, `log.Printf("cpa-manager-plus listening on %s", listener.Addr())`)
+	activateAt := strings.Index(source, "config.ActivateSQLiteSourceSelection(dataDir)")
 	serveAt := strings.Index(source, "go serveHTTPServer(server, listener, stop, serverResult)")
-	if listenAt < 0 || listeningLogAt < listenAt || serveAt < listeningLogAt {
-		t.Fatalf("HTTP listener ordering not found: listen=%d log=%d serve=%d", listenAt, listeningLogAt, serveAt)
+	if listenAt < 0 || activateAt < listenAt || listeningLogAt < activateAt || serveAt < listeningLogAt {
+		t.Fatalf(
+			"HTTP listener/source activation ordering not found: listen=%d activate=%d log=%d serve=%d",
+			listenAt,
+			activateAt,
+			listeningLogAt,
+			serveAt,
+		)
 	}
 	for _, startCall := range []string{
-		"db.RunDerivedStartupMaintenance(ctx)",
+		"applicationStore.RunDerivedStartupMaintenance(ctx)",
 		"automationRuntime.Start(ctx)",
 		"codexInspectionWorker.Start(ctx)",
 		"accountHistoryRollupWorker.Start(ctx)",
 		"usageDerivedRollupWorker.Start(ctx)",
 		"usageHourlyAggregateWorker.Start(ctx)",
-		"db.StartDerivedMaintenance(ctx)",
+		"applicationStore.StartDerivedMaintenance(ctx)",
 		"collectorWorker.Start(ctx)",
-		"NewLegacyQuotaSnapshotMigrationWorker(db).Start(ctx)",
+		"NewLegacyQuotaSnapshotMigrationWorker(applicationStore).Start(ctx)",
 	} {
 		startAt := strings.Index(source, startCall)
 		if startAt < serveAt {
 			t.Fatalf("%s starts before HTTP Serve is launched: start=%d serve=%d", startCall, startAt, serveAt)
 		}
 	}
-	maintenanceAt := strings.Index(source, "db.RunDerivedStartupMaintenance(ctx)")
+	maintenanceAt := strings.Index(source, "applicationStore.RunDerivedStartupMaintenance(ctx)")
 	collectorAt := strings.Index(source, "collectorWorker.Start(ctx)")
 	if maintenanceAt < serveAt || collectorAt < maintenanceAt {
 		t.Fatalf("startup maintenance/collector ordering invalid: serve=%d maintenance=%d collector=%d", serveAt, maintenanceAt, collectorAt)
@@ -173,6 +275,36 @@ func TestManagerDatabaseProcessLockPrecedesStoreOpen(t *testing.T) {
 	lockCloseAt := strings.Index(source, "databaseLock.Close()")
 	if lockAt < 0 || storeOpenAt < lockAt || lockCloseAt < lockAt {
 		t.Fatalf("database lock ordering invalid: lock=%d open=%d close=%d", lockAt, storeOpenAt, lockCloseAt)
+	}
+}
+
+func TestBootstrapRunsAfterRoutedApplicationStoreInitialization(t *testing.T) {
+	content, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	source := string(content)
+	storeOpenAt := strings.Index(source, "store.Open(cfg.DBPath, protector)")
+	runtimeAt := strings.Index(source, "databasemanagementservice.NewRuntime")
+	connectAt := strings.Index(source, "databaseRuntime.ConnectConfiguredMySQL")
+	initializeAt := strings.Index(source, "databaseRuntime.Initialize")
+	routedStoreAt := strings.Index(source, "store.NewRoutedApplicationStore")
+	bootstrapAt := strings.Index(source,
+		"bootstrapservice.Run(context.Background(), cfg, applicationStore, dataKeyCreated)")
+	syncAuthAt := strings.Index(source,
+		"syncDatabaseControlAdminAuth(context.Background(), controlStore, applicationStore)")
+	positions := []int{storeOpenAt, runtimeAt, connectAt, initializeAt, routedStoreAt, bootstrapAt, syncAuthAt}
+	for index, position := range positions {
+		if position < 0 {
+			t.Fatalf("startup routing stage %d was not found", index)
+		}
+		if index > 0 && position <= positions[index-1] {
+			t.Fatalf("startup routing order is invalid: %v", positions)
+		}
+	}
+	if strings.Contains(source,
+		"bootstrapservice.Run(context.Background(), cfg, db, dataKeyCreated)") {
+		t.Fatal("bootstrap still uses the pre-routing SQLite store")
 	}
 }
 
@@ -219,6 +351,9 @@ func TestManagerDataSnapshotCommandUsesSignalContext(t *testing.T) {
 }
 
 func TestLargeDerivedMigrationServesHTTPAndResumesAfterRestart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not support os.Interrupt for child-process shutdown")
+	}
 	if raceDetectorEnabled {
 		t.Skip("external-process availability test is covered by the normal suite; race instrumentation makes the 100k index phase exceed its operational timing budget")
 	}
@@ -432,12 +567,19 @@ func managerServerTestEnvironment(dataDir, dbPath string) []string {
 
 func (p *managerServerProcess) stop(t testing.TB) {
 	t.Helper()
-	if err := p.cmd.Process.Signal(os.Interrupt); err != nil {
-		t.Fatalf("signal manager server helper: %v", err)
+	forceKilled := runtime.GOOS == "windows"
+	var err error
+	if forceKilled {
+		err = p.cmd.Process.Kill()
+	} else {
+		err = p.cmd.Process.Signal(os.Interrupt)
+	}
+	if err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("stop manager server helper: %v", err)
 	}
 	select {
 	case err := <-p.done:
-		if err != nil {
+		if err != nil && !forceKilled {
 			t.Fatalf("manager server helper shutdown: %v\n%s", err, p.logs.String())
 		}
 	case <-time.After(20 * time.Second):

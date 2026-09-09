@@ -142,7 +142,7 @@ where timestamp_ms >= ? and timestamp_ms < ?`, usage.LongContextInputTokenThresh
 
 // AggregateBetween computes summary metrics over [fromMs, toMs).
 func (r *repository) AggregateBetween(ctx context.Context, fromMs, toMs int64) (Aggregate, error) {
-	row := r.db.QueryRowContext(ctx, aggregateSQL, fromMs, toMs)
+	row := r.queryRowContext(ctx, aggregateSQL, fromMs, toMs)
 	var agg Aggregate
 	var success, failure sql.NullInt64
 	if err := row.Scan(
@@ -211,7 +211,7 @@ func (r *repository) TopModelsBetween(ctx context.Context, fromMs, toMs int64, l
 	if limit <= 0 {
 		limit = 5
 	}
-	rows, err := r.db.QueryContext(ctx, topModelsSQL, fromMs, toMs, limit)
+	rows, err := r.queryContext(ctx, topModelsSQL, fromMs, toMs, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +276,7 @@ order by calls desc`, usage.LongContextInputTokenThreshold)
 
 // ModelStatsBetween returns per-model totals for all models in a window.
 func (r *repository) ModelStatsBetween(ctx context.Context, fromMs, toMs int64) ([]ModelStat, error) {
-	rows, err := r.db.QueryContext(ctx, modelStatsSQL, fromMs, toMs)
+	rows, err := r.queryContext(ctx, modelStatsSQL, fromMs, toMs)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +345,7 @@ func (r *repository) RecentFailuresBetween(ctx context.Context, fromMs, toMs int
 	if limit <= 0 {
 		limit = 5
 	}
-	rows, err := r.db.QueryContext(ctx, recentFailuresSQL, fromMs, toMs, limit)
+	rows, err := r.queryContext(ctx, recentFailuresSQL, fromMs, toMs, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +401,7 @@ func (r *repository) BucketTimelineBetween(ctx context.Context, fromMs, toMs int
 	if bucketMs <= 0 {
 		bucketMs = 3600000
 	}
-	rows, err := r.db.QueryContext(ctx, `select
+	rows, err := r.queryContext(ctx, `select
 	cast((timestamp_ms - ?) / ? as integer) as bucket_index,
 	count(*),
 	coalesce(sum(total_tokens), 0),

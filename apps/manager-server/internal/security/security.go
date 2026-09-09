@@ -102,6 +102,9 @@ func LoadOrCreateDataKey(rawValue string, keyPath string) ([]byte, bool, error) 
 		return nil, false, errors.New("data key path is required")
 	}
 	if data, err := os.ReadFile(keyPath); err == nil {
+		if err := hardenDataKeyPermissions(keyPath); err != nil {
+			return nil, false, fmt.Errorf("restrict data key %s: %w", keyPath, err)
+		}
 		key, err := parseStoredDataKey(strings.TrimSpace(string(data)))
 		return key, false, err
 	} else if !os.IsNotExist(err) {
@@ -117,6 +120,9 @@ func LoadOrCreateDataKey(rawValue string, keyPath string) ([]byte, bool, error) 
 	content := base64.RawStdEncoding.EncodeToString(key) + "\n"
 	if err := os.WriteFile(keyPath, []byte(content), 0o600); err != nil {
 		return nil, false, fmt.Errorf("write data key %s: %w", keyPath, err)
+	}
+	if err := hardenDataKeyPermissions(keyPath); err != nil {
+		return nil, false, fmt.Errorf("restrict data key %s: %w", keyPath, err)
 	}
 	return key, true, nil
 }

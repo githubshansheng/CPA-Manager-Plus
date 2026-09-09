@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +27,8 @@ func TestRunCreateRestoreAndDelete(t *testing.T) {
 	writeTestFile(t, dataKeyPath, "key-before", 0o600)
 
 	runSnapshotCommand(t, "create", dbPath, dataKeyPath, snapshotDir)
-	if info, err := os.Stat(snapshotDir); err != nil || info.Mode().Perm() != 0o700 {
+	if info, err := os.Stat(snapshotDir); err != nil ||
+		(runtime.GOOS != "windows" && info.Mode().Perm() != 0o700) {
 		t.Fatalf("snapshot directory info=%v err=%v", info, err)
 	}
 
@@ -46,7 +48,8 @@ func TestRunCreateRestoreAndDelete(t *testing.T) {
 	if _, err := os.Stat(dbPath + "-shm"); !os.IsNotExist(err) {
 		t.Fatalf("post-snapshot shm still exists: %v", err)
 	}
-	if info, err := os.Stat(dbPath); err != nil || info.Mode().Perm() != 0o640 {
+	if info, err := os.Stat(dbPath); err != nil ||
+		(runtime.GOOS != "windows" && info.Mode().Perm() != 0o640) {
 		t.Fatalf("restored database mode=%v err=%v", info.Mode().Perm(), err)
 	}
 

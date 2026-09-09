@@ -92,8 +92,56 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		},
 		"databaseMaintenance": databaseMaintenance,
 	}
+	if sqliteSource, sourceErr := h.App.SetupService.SQLiteSourceStatus(); sourceErr != nil {
+		log.Printf("read SQLite source selection status: %v", sourceErr)
+		sqliteSource.LastError = sourceErr.Error()
+		payload["sqliteSource"] = sqliteSource
+	} else {
+		payload["sqliteSource"] = sqliteSource
+	}
 	if h.App.DatabaseMaintenance != nil {
 		payload["database"] = h.App.DatabaseMaintenance.Snapshot()
 	}
+	if h.App.DatabaseManagement != nil {
+		databaseStatus, statusErr := h.App.DatabaseManagement.Status(r.Context())
+		if statusErr != nil {
+			log.Printf("read database topology status: %v", statusErr)
+		} else {
+			payload["databaseTopology"] = databaseStatus.DatabaseTopology
+			payload["databases"] = databaseStatus.Databases
+			payload["replication"] = databaseStatus.Replication
+			payload["databaseMigration"] = databaseStatus.DatabaseMigration
+			payload["cacheCoverage"] = databaseStatus.CacheCoverage
+		}
+	}
 	response.JSON(w, http.StatusOK, payload)
+}
+
+func (h *Handler) Restart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.MethodNotAllowed(w)
+		return
+	}
+	if !middleware.AuthorizePanel(w, r, h.App.AdminAuthService) {
+		return
+	}
+	if h.App.RestartRequester == nil {
+		response.JSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "in-process restart is unavailable for this Manager Server runtime",
+			"code":  "system_restart_unavailable",
+		})
+		return
+	}
+	if !h.App.RestartRequester.RequestRestart() {
+		response.JSON(w, http.StatusConflict, map[string]any{
+			"error": "a Manager Server restart has already been requested",
+			"code":  "system_restart_already_requested",
+		})
+		return
+	}
+	response.JSON(w, http.StatusAccepted, map[string]any{
+		"ok":         true,
+		"restarting": true,
+		"startedAt":  h.App.StartedAt,
+	})
 }

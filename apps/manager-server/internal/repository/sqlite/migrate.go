@@ -1786,8 +1786,13 @@ func ensureUsageMonitoringProjectionIdentity(db *sql.DB) error {
 		}
 	}
 
+	// A current format marker is already authoritative. Rewriting only its
+	// timestamp on every startup creates a data change while schema migration
+	// has the Outbox journal suspended, so a resumed history copy can see two
+	// different payloads at the same row version. The preflight above rejects a
+	// different non-empty version; only insert the marker when it is absent.
 	if _, err := tx.Exec(`insert into settings (key, value, updated_at_ms) values (?, ?, ?)
-		on conflict(key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+		on conflict(key) do nothing`,
 		usageMonitoringModelFormatVersionKey,
 		usageidentity.ModelFormatVersion,
 		time.Now().UnixMilli(),

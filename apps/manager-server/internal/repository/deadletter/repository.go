@@ -4,6 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"time"
+
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 )
 
 type Repository interface {
@@ -16,12 +20,18 @@ type repository struct {
 }
 
 func New(db *sql.DB) Repository {
+	return NewForBackend(db, database.BackendSQLite)
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	_ = dialect.ForBackend(backend)
 	return &repository{db: db}
 }
 
 func (r *repository) Insert(ctx context.Context, payload string, errText string) error {
-	_, err := r.db.ExecContext(
+	_, err := outboxcontext.Exec(
 		ctx,
+		r.db,
 		`insert into dead_letter_events(payload, error, created_at_ms) values(?, ?, ?)`,
 		payload,
 		errText,

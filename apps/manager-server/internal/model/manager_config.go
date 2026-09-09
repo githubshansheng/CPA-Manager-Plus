@@ -5,7 +5,14 @@ type ManagerConfig struct {
 	Collector            ManagerCollectorConfig            `json:"collector"`
 	CodexInspection      ManagerCodexInspectionConfig      `json:"codexInspection"`
 	ExternalUsageService ManagerExternalUsageServiceConfig `json:"externalUsageService"`
+	CustomPages          []ManagerCustomPageConfig         `json:"customPages,omitempty"`
 	UpdatedAtMS          int64                             `json:"updatedAtMs,omitempty"`
+}
+
+type ManagerCustomPageConfig struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	URL   string `json:"url"`
 }
 
 type ManagerCPAConnectionConfig struct {

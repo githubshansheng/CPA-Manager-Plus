@@ -127,6 +127,76 @@ jobs:
         working-directory: apps/manager-server
         run: go test ./...
 
+      - name: Race test
+        working-directory: apps/manager-server
+        run: go test -race ./...
+
+      - name: Vet
+        working-directory: apps/manager-server
+        run: go vet ./...
+
+  manager-server-mysql:
+    name: Manager Server MySQL (${{ matrix.mysql-version }})
+    needs: changes
+    if: needs.changes.outputs.manager_server == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql-version:
+          - 8.0.12
+          - 8.0.36
+          - '8.4'
+
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql-version }}
+        env:
+          MYSQL_ROOT_PASSWORD: cpamp-ci-password
+          MYSQL_DATABASE: cpamp
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pcpamp-ci-password"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.24.x'
+          cache-dependency-path: apps/manager-server/go.sum
+
+      - name: Create strict binary-collation test schema
+        env:
+          MYSQL_CONTAINER_ID: ${{ job.services.mysql.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.mysql-version }}" == "8.0.12" ]]; then
+            cpamp_collation=utf8mb4_0900_as_cs
+          else
+            cpamp_collation=utf8mb4_0900_bin
+          fi
+          docker exec "${MYSQL_CONTAINER_ID}" mysql -uroot -pcpamp-ci-password -e \
+            "DROP DATABASE IF EXISTS cpamp; CREATE DATABASE cpamp CHARACTER SET utf8mb4 COLLATE ${cpamp_collation};"
+
+      - name: Run SQLite/MySQL repository conformance
+        working-directory: apps/manager-server
+        env:
+          CPAMP_MYSQL_INTEGRATION: '1'
+          CPAMP_MYSQL_TEST_HOST: 127.0.0.1
+          CPAMP_MYSQL_TEST_PORT: '3306'
+          CPAMP_MYSQL_TEST_DATABASE: cpamp
+          CPAMP_MYSQL_TEST_USERNAME: root
+          CPAMP_MYSQL_TEST_PASSWORD: cpamp-ci-password
+        run: go test -p 1 ./... -count=1
+
   manager-server-windows-sqlite:
     name: Manager Server SQLite (Windows)
     needs: changes
@@ -305,6 +375,7 @@ jobs:
       - changes
       - frontend
       - manager-server
+      - manager-server-mysql
       - manager-server-windows-sqlite
       - native-control
       - docker-build
@@ -319,6 +390,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           FRONTEND_RESULT: ${{ needs.frontend.result }}
           MANAGER_SERVER_RESULT: ${{ needs['manager-server'].result }}
+          MYSQL_RESULT: ${{ needs['manager-server-mysql'].result }}
           WINDOWS_SQLITE_RESULT: ${{ needs['manager-server-windows-sqlite'].result }}
           NATIVE_CONTROL_RESULT: ${{ needs['native-control'].result }}
           DOCKER_BUILD_RESULT: ${{ needs['docker-build'].result }}
@@ -332,6 +404,7 @@ jobs:
             "Scope:${CHANGES_RESULT}"
             "Frontend:${FRONTEND_RESULT}"
             "Manager Server:${MANAGER_SERVER_RESULT}"
+            "Manager Server MySQL:${MYSQL_RESULT}"
             "Manager Server SQLite (Windows):${WINDOWS_SQLITE_RESULT}"
             "Native Control:${NATIVE_CONTROL_RESULT}"
             "Docker Build:${DOCKER_BUILD_RESULT}"

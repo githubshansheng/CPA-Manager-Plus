@@ -140,6 +140,55 @@ CPAMP_DRY_RUN=1 bash install-cpamp.sh
 
 升级、修复和管理员密钥恢复行为见 [一键安装脚本](https://seakee.github.io/CPA-Manager-Plus/docs/deployment/installer.html)。
 
+### 从源码一键构建和运行
+
+需要 Node.js 22+、npm 和 Go 1.24+。脚本会执行前端生产构建，将单文件面板
+嵌入临时 Go 源码副本，再生成并管理本机可执行文件；不需要 Docker。
+
+Windows：
+
+```powershell
+.\cpa-manager-plus.bat start
+.\cpa-manager-plus.bat status
+.\cpa-manager-plus.bat rebuild
+.\cpa-manager-plus.bat logs 120
+.\cpa-manager-plus.bat admin-key
+.\cpa-manager-plus.bat stop
+```
+
+Linux / macOS：
+
+```bash
+chmod +x cpa-manager-plus.sh
+./cpa-manager-plus.sh start
+./cpa-manager-plus.sh status
+./cpa-manager-plus.sh rebuild
+./cpa-manager-plus.sh logs 120
+./cpa-manager-plus.sh admin-key
+./cpa-manager-plus.sh stop
+```
+
+| 命令        | 行为                                                               |
+| ----------- | ------------------------------------------------------------------ |
+| `build`     | 安装依赖并完整构建前端和 Go 服务，不启动                           |
+| `start`     | 启动服务；本机二进制不存在时自动先构建                             |
+| `stop`      | 只停止由源码脚本管理的后台进程                                     |
+| `restart`   | 使用现有二进制重启                                                 |
+| `rebuild`   | 保持旧服务运行完成候选构建，再短暂停服、替换并启动；失败时回滚旧版 |
+| `status`    | 检查 PID 元数据及 `/health`                                        |
+| `logs`      | 查看或持续跟踪标准输出、错误日志                                   |
+| `admin-key` | 显示源码运行环境在本地托管的管理员密钥                             |
+
+默认地址为 `http://127.0.0.1:18317`，可使用 `--port 18318` 覆盖端口。
+构建产物、源码运行数据、PID 和日志都在 `.local/`，与 Docker 数据卷隔离。
+`build` 和 `rebuild` 默认执行 `npm ci`；确认依赖未变化时可设置
+`CPA_MANAGER_PLUS_SKIP_NPM_CI=1` 加快重复构建。首次启动时，脚本会把生成的
+管理员密钥保存在私有文件 `.local/data/admin.key`，避免重启或日志轮换后丢失；
+使用 `admin-key` 命令查看。请把 `.local/data/`、管理员密钥和运行日志都视为
+敏感数据。显式设置的 `CPA_MANAGER_ADMIN_KEY` 或
+`CPA_MANAGER_ADMIN_KEY_FILE` 仍由外部管理，并会在下次重启时同步到所选
+SQLite 数据库；`admin-key` 不会显示它们。
+
 ### CPA + CPAMP 一起部署
 
 ```yaml

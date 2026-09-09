@@ -100,9 +100,18 @@ if [ "$1" = "compose" ] && [ "\${2:-}" = "exec" ]; then
       ;;
     *'/status'*)
       if [ "\${FAKE_DOCKER_AUTH_OK:-1}" = "1" ]; then
+        if [ "\${FAKE_DOCKER_RECOVERY_MODE:-0}" = "1" ]; then
+          printf '{"recoveryMode":true}\n'
+        else
+          printf '{"recoveryMode":false}\n'
+        fi
         exit 0
       fi
       exit 1
+      ;;
+    *'/usage-service/config'*)
+      [ "\${FAKE_DOCKER_BUSINESS_READY:-1}" = "1" ]
+      exit
       ;;
     *) exit 0 ;;
   esac
@@ -541,6 +550,15 @@ for arg in "$@"; do
       ;;
     */status)
       [ "\${FAKE_NATIVE_AUTH_OK:-1}" = "1" ]
+      if [ "\${FAKE_NATIVE_RECOVERY_MODE:-0}" = "1" ]; then
+        printf '{"recoveryMode":true}\n'
+      else
+        printf '{"recoveryMode":false}\n'
+      fi
+      exit
+      ;;
+    */usage-service/config)
+      [ "\${FAKE_NATIVE_BUSINESS_READY:-1}" = "1" ]
       exit
       ;;
     */v0/management/cpa-connection/validate)
@@ -4142,6 +4160,48 @@ secrets:
     }
   });
 
+  it('does not commit a Docker deployment that starts in database recovery mode', () => {
+    const installDir = mkdtempSync(path.join(os.tmpdir(), 'cpamp-installer-'));
+    const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'cpamp-installer-bin-'));
+
+    try {
+      mkdirSync(path.join(installDir, 'secrets'), { recursive: true });
+      writeFileSync(
+        path.join(installDir, '.env'),
+        'COMPOSE_PROJECT_NAME=cpamp\nCPAMP_IMAGE=example/cpamp:v1\nCPAMP_PORT=18317\n'
+      );
+      writeFileSync(
+        path.join(installDir, 'compose.yaml'),
+        'services:\n  cpa-manager-plus:\n    image: ${CPAMP_IMAGE}\n'
+      );
+      writeFileSync(path.join(installDir, 'secrets/cpamp-admin-key'), 'cpamp_existing_admin_key\n');
+      writeFakeDocker(fakeBin);
+
+      const result = spawnSync('bash', [installerPath], {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          CPAMP_OPERATION: 'upgrade',
+          CPAMP_NON_INTERACTIVE: '1',
+          CPAMP_CONFIRM: '1',
+          CPAMP_LANG: 'en-US',
+          CPAMP_INSTALL_DIR: installDir,
+          FAKE_DOCKER_AUTH_OK: '1',
+          FAKE_DOCKER_RECOVERY_MODE: '1',
+          PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+        },
+        encoding: 'utf8',
+      });
+
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('normal business-data API is unavailable');
+      expect(result.stdout).not.toContain('Install steps completed');
+    } finally {
+      rmSync(installDir, { recursive: true, force: true });
+      rmSync(fakeBin, { recursive: true, force: true });
+    }
+  });
+
   it('backs up generated config before regenerating a managed Docker install', () => {
     const installDir = mkdtempSync(path.join(os.tmpdir(), 'cpamp-installer-'));
     const oldEnv = 'COMPOSE_PROJECT_NAME=cpamp\nCPAMP_IMAGE=example/old:v1\nCPAMP_PORT=18317\n';
@@ -5345,6 +5405,24 @@ exec /bin/mv "$@"
       name: 'admin authentication',
       env: { FAKE_NATIVE_HEALTH_OK: '1', FAKE_NATIVE_AUTH_OK: '0' },
       expected: 'admin key verification failed',
+    },
+    {
+      name: 'database recovery mode',
+      env: {
+        FAKE_NATIVE_HEALTH_OK: '1',
+        FAKE_NATIVE_AUTH_OK: '1',
+        FAKE_NATIVE_RECOVERY_MODE: '1',
+      },
+      expected: 'normal business-data API is unavailable',
+    },
+    {
+      name: 'business-data endpoint',
+      env: {
+        FAKE_NATIVE_HEALTH_OK: '1',
+        FAKE_NATIVE_AUTH_OK: '1',
+        FAKE_NATIVE_BUSINESS_READY: '0',
+      },
+      expected: 'normal business-data API is unavailable',
     },
     {
       name: 'CPA connection validation',

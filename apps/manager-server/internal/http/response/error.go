@@ -45,6 +45,7 @@ func ManagerConfigErrorStatus(err error) int {
 	case strings.Contains(message, "cpaBaseUrl and managementKey are required"),
 		strings.Contains(message, "CPA redis-usage-queue-retention-seconds"),
 		strings.Contains(message, "pollIntervalMs must be less than or equal"),
+		strings.Contains(message, "invalid custom page configuration"),
 		strings.Contains(message, "invalid time zone"):
 		return http.StatusBadRequest
 	case strings.Contains(message, "management API validation failed"),
@@ -66,6 +67,19 @@ func ModelPriceErrorStatus(err error) int {
 func UsageServiceErrorCode(err error) string {
 	message := err.Error()
 	switch {
+	case strings.Contains(message, "database routing generation conflict"),
+		strings.Contains(message, "database control generation conflict"),
+		strings.Contains(message, "idempotency key was already used"):
+		return "database_generation_conflict"
+	case strings.Contains(message, "database management is unavailable"):
+		return "database_management_unavailable"
+	case strings.Contains(message, "confirmation is required"),
+		strings.Contains(message, "confirmInsecureTls"):
+		return "database_confirmation_required"
+	case strings.Contains(message, "mysql business-read repository conformance gate"):
+		return "mysql_read_conformance_pending"
+	case strings.Contains(message, "target write repository and epoch fence are not ready"):
+		return "database_write_failover_not_ready"
 	case strings.Contains(message, "connection setup is managed by environment variables"):
 		return "connection_env_managed"
 	case strings.Contains(message, "locked by environment variable"):
@@ -92,6 +106,8 @@ func UsageServiceErrorCode(err error) string {
 		return "poll_interval_exceeds_retention"
 	case strings.Contains(message, "invalid time zone"):
 		return "invalid_time_zone"
+	case strings.Contains(message, "invalid custom page configuration"):
+		return "invalid_custom_page"
 	case strings.Contains(message, "management API validation failed"):
 		return "management_api_validation_failed"
 	case strings.Contains(message, "management API config request failed"):

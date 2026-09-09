@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
@@ -80,10 +81,11 @@ func (r *repository) CatchUpDashboardHourly(ctx context.Context, limit int, nowM
 	}
 	defer r.releaseCatchUp()
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	rawTx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return CatchUpResult{}, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() {
 		_ = tx.Rollback()
 	}()
@@ -179,10 +181,11 @@ func (r *repository) dashboardRows(
 	if fromMS >= toMS {
 		return []DashboardHourlyRow{}, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 
 	checkpoint, err := checkpointInTx(ctx, tx, DashboardHourlyCheckpointName)
@@ -214,7 +217,7 @@ func (r *repository) dashboardRows(
 
 func mergeStoredDashboardRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	fromMS int64,
 	toMS int64,
 	projection dashboardProjection,
@@ -259,7 +262,7 @@ func mergeStoredDashboardRows(
 
 func mergeRawDashboardRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	fromMS int64,
 	toMS int64,
 	afterEventID int64,
@@ -446,7 +449,7 @@ func sortedDashboardRows(grouped map[dashboardHourlyKey]*DashboardHourlyRow) []D
 	return result
 }
 
-func dashboardEventsAfterCheckpoint(ctx context.Context, tx *sql.Tx, lastEventID, targetEventID int64, limit int) ([]dashboardEventRow, error) {
+func dashboardEventsAfterCheckpoint(ctx context.Context, tx *dialect.Tx, lastEventID, targetEventID int64, limit int) ([]dashboardEventRow, error) {
 	rows, err := tx.QueryContext(ctx, `select
 	id,
 	timestamp_ms,
@@ -562,7 +565,7 @@ func aggregateDashboardHourly(events []dashboardEventRow, nowMS int64) []Dashboa
 	return result
 }
 
-func upsertDashboardHourlyRows(ctx context.Context, tx *sql.Tx, rows []DashboardHourlyRow) error {
+func upsertDashboardHourlyRows(ctx context.Context, tx *dialect.Tx, rows []DashboardHourlyRow) error {
 	if len(rows) == 0 {
 		return nil
 	}

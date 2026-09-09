@@ -193,7 +193,7 @@ func (r *repository) WriteCompatibleUsage(ctx context.Context, writer io.Writer,
 }
 
 func (r *repository) compatibleOrderedIDs(ctx context.Context, snapshot usageSnapshot, expectedCount int) ([]int64, error) {
-	rows, err := r.db.QueryContext(
+	rows, err := r.queryContext(
 		ctx,
 		compatibleUsageOrderedIDsQuery,
 		snapshot.maxID,
@@ -232,7 +232,7 @@ func (r *repository) compatibleRowsByIDs(ctx context.Context, ids []int64) (map[
 	for index, id := range ids {
 		args[index] = id
 	}
-	rows, err := r.db.QueryContext(ctx, compatibleUsageDetailQuery(len(ids)), args...)
+	rows, err := r.queryContext(ctx, compatibleUsageDetailQuery(len(ids)), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -424,7 +424,7 @@ func (r *repository) ExportJSONL(ctx context.Context) ([]byte, error) {
 
 func (r *repository) captureUsageSnapshot(ctx context.Context, limit int) (usageSnapshot, error) {
 	var snapshot usageSnapshot
-	if err := r.db.QueryRowContext(ctx, `select coalesce(max(id), 0) from usage_events`).Scan(&snapshot.maxID); err != nil {
+	if err := r.queryRowContext(ctx, `select coalesce(max(id), 0) from usage_events`).Scan(&snapshot.maxID); err != nil {
 		return usageSnapshot{}, err
 	}
 	if snapshot.maxID == 0 {
@@ -432,14 +432,14 @@ func (r *repository) captureUsageSnapshot(ctx context.Context, limit int) (usage
 		return snapshot, nil
 	}
 
-	err := r.db.QueryRowContext(ctx, `select timestamp_ms, id
+	err := r.queryRowContext(ctx, `select timestamp_ms, id
 	from (
 		select timestamp_ms, id
 		from usage_events
 		where id <= ?
 		order by timestamp_ms desc, id desc
 		limit ?
-	)
+	) as recent_usage
 	order by timestamp_ms asc, id asc
 	limit 1`, snapshot.maxID, limit).Scan(&snapshot.cutoffTimestampMS, &snapshot.cutoffID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -457,7 +457,7 @@ func (r *repository) compatibleUsageTotals(ctx context.Context, snapshot usageSn
 		return compatibleUsageTotals{}, nil
 	}
 	var totals compatibleUsageTotals
-	if err := r.db.QueryRowContext(ctx, `select
+	if err := r.queryRowContext(ctx, `select
 		count(*),
 		count(*) - coalesce(sum(case when failed <> 0 then 1 else 0 end), 0),
 		coalesce(sum(case when failed <> 0 then 1 else 0 end), 0),
@@ -477,7 +477,7 @@ func (r *repository) compatibleUsageTotals(ctx context.Context, snapshot usageSn
 }
 
 func (r *repository) exportBatch(ctx context.Context, snapshot usageSnapshot, cursorTimestampMS, cursorID int64) ([]exportRow, error) {
-	rows, err := r.db.QueryContext(ctx, `select
+	rows, err := r.queryContext(ctx, `select
 		id,
 		request_id, event_hash, timestamp_ms, timestamp, provider, executor_type, model, endpoint, method, path,
 		auth_type, auth_index, source, source_hash, api_key_hash,

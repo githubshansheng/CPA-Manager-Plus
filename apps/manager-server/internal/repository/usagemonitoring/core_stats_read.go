@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
 
@@ -26,7 +27,7 @@ type dailyModelStatKey struct {
 
 func loadDailyAggregate(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	state State,
 	projectionCoverageEventID int64,
 	projectionComplete bool,
@@ -119,7 +120,7 @@ func loadDailyAggregate(
 
 func mergeStoredAggregate(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	revision string,
 	filter AnalyticsFilter,
 	fromMS int64,
@@ -147,7 +148,7 @@ func mergeStoredAggregate(
 
 func mergeProjectedAggregate(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	projectionCoverageEventID int64,
 	projectionComplete bool,
 	filter AnalyticsFilter,
@@ -244,7 +245,7 @@ func (accumulator dailyAggregateAccumulator) result() Aggregate {
 
 func loadDailyModelStats(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	state State,
 	projectionCoverageEventID int64,
 	projectionComplete bool,
@@ -312,7 +313,7 @@ func loadDailyModelStats(
 
 func mergeStoredModelStats(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	revision string,
 	filter AnalyticsFilter,
 	fromMS int64,
@@ -342,7 +343,7 @@ func mergeStoredModelStats(
 
 func mergeProjectedModelStats(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	projectionCoverageEventID int64,
 	projectionComplete bool,
 	filter AnalyticsFilter,

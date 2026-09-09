@@ -184,6 +184,21 @@ describe('panel feature availability', () => {
     expect(availability.reason).toBe('monitoring_disabled');
   });
 
+  it('exposes custom pages from the authenticated Manager config', () => {
+    const customPages = [{ id: 'status', title: 'Status', url: 'https://status.example.test' }];
+    const availability = resolvePanelFeatureAvailability({
+      panelHostConfirmed: true,
+      panelHostedByUsageService: true,
+      panelBase: 'http://manager.local:18317',
+      managerServiceBase: 'http://manager.local:18317',
+      managerConfig: buildManagerConfig({ customPages }),
+      hasManagerCandidate: true,
+      managementKey: 'management-key',
+    });
+
+    expect(availability.customPages).toEqual(customPages);
+  });
+
   it('requires a configured CPA connection for server inspection', () => {
     const availability = resolvePanelFeatureAvailability({
       panelHostConfirmed: true,

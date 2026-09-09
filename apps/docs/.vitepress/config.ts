@@ -47,6 +47,7 @@ const zhSidebar: DefaultTheme.Sidebar = [
     items: [
       { text: '更新 CPAMP', link: '/operations/update' },
       { text: '备份与恢复', link: '/operations/backup' },
+      { text: '迁移到 MySQL', link: '/operations/mysql-migration' },
       { text: '重置管理员密钥', link: '/operations/reset-admin-key' },
       { text: '请求监控为空', link: '/troubleshooting/request-monitoring' },
       { text: '日志查看', link: '/manual/logs' },
@@ -113,6 +114,7 @@ const enSidebar: DefaultTheme.Sidebar = [
     items: [
       { text: 'Upgrade CPAMP', link: '/en/operations/update' },
       { text: 'Backup And Restore', link: '/en/operations/backup' },
+      { text: 'Migrate To MySQL', link: '/en/operations/mysql-migration' },
       { text: 'Reset Admin Key', link: '/en/operations/reset-admin-key' },
       {
         text: 'Monitoring Has No Data',

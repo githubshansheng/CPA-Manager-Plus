@@ -9,7 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
 
@@ -25,11 +28,16 @@ type Repository interface {
 }
 
 type repository struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect dialect.Dialect
 }
 
 func New(db *sql.DB) Repository {
-	return &repository{db: db}
+	return NewForBackend(db, database.BackendSQLite)
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return &repository{db: db, dialect: dialect.ForBackend(backend)}
 }
 
 func (r *repository) Upsert(ctx context.Context, input model.AccountActionCandidateUpsert) (model.AccountActionCandidate, error) {
@@ -73,19 +81,49 @@ func (r *repository) Upsert(ctx context.Context, input model.AccountActionCandid
 	if seenAt <= 0 {
 		seenAt = now
 	}
+	attempts := 1
+	if r.dialect.IsMySQL() {
+		attempts = 5
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		item, err := r.upsertOnce(ctx, input, seenAt, now)
+		if err == nil {
+			return item, nil
+		}
+		lastErr = err
+		if !r.dialect.IsRetryableWriteConflict(err) {
+			return item, err
+		}
+		if err := ctx.Err(); err != nil {
+			return model.AccountActionCandidate{}, err
+		}
+	}
+	return model.AccountActionCandidate{}, fmt.Errorf("account action upsert exhausted MySQL conflict retries: %w", lastErr)
+}
 
-	tx, err := r.db.BeginTx(ctx, nil)
+func (r *repository) upsertOnce(
+	ctx context.Context,
+	input model.AccountActionCandidateUpsert,
+	seenAt int64,
+	now int64,
+) (model.AccountActionCandidate, error) {
+	var options *sql.TxOptions
+	if r.dialect.IsMySQL() {
+		options = &sql.TxOptions{Isolation: sql.LevelSerializable}
+	}
+	tx, err := outboxcontext.Begin(ctx, r.db, options)
 	if err != nil {
 		return model.AccountActionCandidate{}, err
 	}
 	defer tx.Rollback()
 
-	id, found, err := findPendingCandidateID(ctx, tx, input)
+	id, found, err := findPendingCandidateID(ctx, tx.Tx, input, r.dialect.ForUpdate())
 	if err != nil {
 		return model.AccountActionCandidate{}, err
 	}
 	if !found {
-		id, found, err = findUpgradeableCandidateID(ctx, tx, input)
+		id, found, err = findUpgradeableCandidateID(ctx, tx.Tx, input, r.dialect.ForUpdate())
 		if err != nil {
 			return model.AccountActionCandidate{}, err
 		}
@@ -156,7 +194,7 @@ func (r *repository) Upsert(ctx context.Context, input model.AccountActionCandid
 			auth_label = coalesce(nullif(?, ''), auth_label),
 			reason_code = coalesce(nullif(?, ''), reason_code),
 			reason = coalesce(nullif(?, ''), reason),
-			auto_disable_eligible = max(auto_disable_eligible, ?),
+			auto_disable_eligible = `+r.dialect.MaxWithParameter("auto_disable_eligible")+`,
 			evidence_json = coalesce(nullif(?, ''), evidence_json),
 			last_error = null,
 			last_seen_at_ms = ?,
@@ -177,7 +215,12 @@ func (r *repository) Upsert(ctx context.Context, input model.AccountActionCandid
 	return item, nil
 }
 
-func findPendingCandidateID(ctx context.Context, tx *sql.Tx, input model.AccountActionCandidateUpsert) (int64, bool, error) {
+func findPendingCandidateID(
+	ctx context.Context,
+	tx *sql.Tx,
+	input model.AccountActionCandidateUpsert,
+	lockClause string,
+) (int64, bool, error) {
 	base := `select id from account_action_candidates
 		where status = ? and auth_file_name = ? and action_type = ?
 		and coalesce(trim(reason_code), '') = ?`
@@ -194,7 +237,7 @@ func findPendingCandidateID(ctx context.Context, tx *sql.Tx, input model.Account
 				and coalesce(trim(auth_index), '') = ?
 				and (coalesce(lower(replace(trim(provider), '_', '-')), '') = '' or coalesce(lower(replace(trim(provider), '_', '-')), '') = 'codex')`
 			args = append(args, input.AuthIndex)
-			return querySingleCandidateID(ctx, tx, query+` order by id asc limit 2`, args...)
+			return querySingleCandidateID(ctx, tx, query+` order by id asc limit 2`+lockClause, args...)
 		}
 		if input.AccountIDSnapshot == "" || input.AccountSnapshot == "" {
 			// Preserve an unowned review row if the caller wants to display it,
@@ -207,7 +250,7 @@ func findPendingCandidateID(ctx context.Context, tx *sql.Tx, input model.Account
 			and coalesce(lower(replace(trim(provider), '_', '-')), '') = 'codex'
 			and trim(account_id_snapshot) = ?
 			and lower(trim(account_snapshot)) = ?
-			order by id asc limit 2`, append(args, input.AccountIDSnapshot, input.AccountSnapshot)...)
+			order by id asc limit 2`+lockClause, append(args, input.AccountIDSnapshot, input.AccountSnapshot)...)
 	}
 
 	authIndexIdentity, accountIDIdentity, providerIdentity, accountSnapshotIdentity := candidateIdentity(input)
@@ -224,7 +267,7 @@ func findPendingCandidateID(ctx context.Context, tx *sql.Tx, input model.Account
 		and case when coalesce(trim(auth_index), '') <> '' or coalesce(trim(account_id_snapshot), '') <> '' then ''
 			else coalesce(trim(account_snapshot), '')
 		end = ?
-		order by id asc limit 2`, append(args, authIndexIdentity, accountIDIdentity, providerIdentity, accountSnapshotIdentity)...)
+		order by id asc limit 2`+lockClause, append(args, authIndexIdentity, accountIDIdentity, providerIdentity, accountSnapshotIdentity)...)
 }
 
 func candidateIdentity(input model.AccountActionCandidateUpsert) (authIndex string, accountID string, provider string, accountSnapshot string) {
@@ -254,7 +297,12 @@ func codexCandidateIdentityConflict(existing model.AccountActionCandidate, input
 	return ""
 }
 
-func findUpgradeableCandidateID(ctx context.Context, tx *sql.Tx, input model.AccountActionCandidateUpsert) (int64, bool, error) {
+func findUpgradeableCandidateID(
+	ctx context.Context,
+	tx *sql.Tx,
+	input model.AccountActionCandidateUpsert,
+	lockClause string,
+) (int64, bool, error) {
 	provider := normalizeProvider(input.Provider)
 	accountSnapshot := strings.TrimSpace(input.AccountSnapshot)
 	baseArgs := []any{
@@ -275,7 +323,7 @@ func findUpgradeableCandidateID(ctx context.Context, tx *sql.Tx, input model.Acc
 				and coalesce(trim(auth_index), '') = '' and coalesce(trim(account_id_snapshot), '') = ?
 				and lower(trim(account_snapshot)) = ?
 				and coalesce(lower(replace(trim(provider), '_', '-')), '') = 'codex'
-			order by id asc limit 2`, append(baseArgs, input.AccountIDSnapshot, accountSnapshot)...)
+			order by id asc limit 2`+lockClause, append(baseArgs, input.AccountIDSnapshot, accountSnapshot)...)
 	}
 	if input.AuthIndex != "" && input.AccountIDSnapshot != "" && provider != "" {
 		id, found, err := querySingleCandidateID(ctx, tx, `select id from account_action_candidates
@@ -286,7 +334,7 @@ func findUpgradeableCandidateID(ctx context.Context, tx *sql.Tx, input model.Acc
 					when 'grok' then 'xai'
 					else coalesce(lower(replace(trim(provider), '_', '-')), '')
 				end = ?
-			order by id asc limit 2`, append(baseArgs, input.AccountIDSnapshot, provider)...)
+			order by id asc limit 2`+lockClause, append(baseArgs, input.AccountIDSnapshot, provider)...)
 		if err != nil || found {
 			return id, found, err
 		}
@@ -303,7 +351,7 @@ func findUpgradeableCandidateID(ctx context.Context, tx *sql.Tx, input model.Acc
 				else coalesce(lower(replace(trim(provider), '_', '-')), '')
 			end = ?
 			and coalesce(trim(account_snapshot), '') = ?
-		order by id asc limit 2`, append(baseArgs, provider, accountSnapshot)...)
+		order by id asc limit 2`+lockClause, append(baseArgs, provider, accountSnapshot)...)
 }
 
 func querySingleCandidateID(ctx context.Context, tx *sql.Tx, query string, args ...any) (int64, bool, error) {
@@ -421,7 +469,7 @@ func (r *repository) updateStatus(ctx context.Context, id int64, status string, 
 		query += ` and status = ?`
 		args = append(args, model.AccountActionStatusPending)
 	}
-	res, err := r.db.ExecContext(ctx, query, args...)
+	res, err := outboxcontext.Exec(ctx, r.db, query, args...)
 	if err != nil {
 		return model.AccountActionCandidate{}, err
 	}
@@ -436,7 +484,7 @@ func (r *repository) RecordFailure(ctx context.Context, id int64, reason string)
 	if id <= 0 {
 		return errors.New("candidate id is required")
 	}
-	_, err := r.db.ExecContext(ctx, `update account_action_candidates set last_error = ?, updated_at_ms = ? where id = ?`, nullString(reason), time.Now().UnixMilli(), id)
+	_, err := outboxcontext.Exec(ctx, r.db, `update account_action_candidates set last_error = ?, updated_at_ms = ? where id = ?`, nullString(reason), time.Now().UnixMilli(), id)
 	return err
 }
 
@@ -447,7 +495,7 @@ func (r *repository) MarkAutoDisabled(ctx context.Context, id int64, disabledAtM
 	if disabledAtMS <= 0 {
 		disabledAtMS = time.Now().UnixMilli()
 	}
-	res, err := r.db.ExecContext(ctx, `update account_action_candidates set auto_disabled_at_ms = ?, last_error = null, updated_at_ms = ? where id = ? and status = ?`, disabledAtMS, disabledAtMS, id, model.AccountActionStatusPending)
+	res, err := outboxcontext.Exec(ctx, r.db, `update account_action_candidates set auto_disabled_at_ms = ?, last_error = null, updated_at_ms = ? where id = ? and status = ?`, disabledAtMS, disabledAtMS, id, model.AccountActionStatusPending)
 	if err != nil {
 		return err
 	}

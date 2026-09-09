@@ -361,8 +361,14 @@ function Get-PidRecordState {
     return [pscustomobject]@{ State = 'conflict'; Record = $record; Snapshot = $snapshot }
   }
 
-  if (-not $snapshot.StartTimeUtc -or $snapshot.StartTimeUtc -ne $record.StartTimeUtc) {
+  if (-not $snapshot.StartTimeUtc) {
     return [pscustomobject]@{ State = 'conflict'; Record = $record; Snapshot = $snapshot }
+  }
+
+  # A matching PID with a different start time is a reused PID, not the
+  # process described by this private metadata record.
+  if ($snapshot.StartTimeUtc -ne $record.StartTimeUtc) {
+    return [pscustomobject]@{ State = 'stale'; Record = $record; Snapshot = $snapshot }
   }
 
   if ($record.BinaryPath -and $snapshot.BinaryPath) {
@@ -433,6 +439,40 @@ function Start-DetachedProcess {
   $launcher = @'
 $ErrorActionPreference = 'Stop'
 
+function ConvertTo-WindowsProcessArgument {
+  param([AllowEmptyString()][string]$Value)
+
+  if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+    return $Value
+  }
+
+  $builder = New-Object System.Text.StringBuilder
+  [void]$builder.Append([char]34)
+  $backslashCount = 0
+  foreach ($character in $Value.ToCharArray()) {
+    if ($character -eq [char]92) {
+      $backslashCount++
+      continue
+    }
+    if ($character -eq [char]34) {
+      [void]$builder.Append([char]92, (($backslashCount * 2) + 1))
+      [void]$builder.Append([char]34)
+      $backslashCount = 0
+      continue
+    }
+    if ($backslashCount -gt 0) {
+      [void]$builder.Append([char]92, $backslashCount)
+      $backslashCount = 0
+    }
+    [void]$builder.Append($character)
+  }
+  if ($backslashCount -gt 0) {
+    [void]$builder.Append([char]92, ($backslashCount * 2))
+  }
+  [void]$builder.Append([char]34)
+  return $builder.ToString()
+}
+
 try {
   $config = Get-Content -LiteralPath $args[0] -Raw | ConvertFrom-Json -ErrorAction Stop
   $arguments = @()
@@ -453,7 +493,10 @@ try {
     PassThru               = $true
   }
   if ($arguments.Count -gt 0) {
-    $startInfo.ArgumentList = [string[]]$arguments
+    $serializedArguments = foreach ($argument in $arguments) {
+      ConvertTo-WindowsProcessArgument -Value ([string]$argument)
+    }
+    $startInfo.ArgumentList = $serializedArguments -join ' '
   }
 
   $process = Start-Process @startInfo
@@ -489,8 +532,8 @@ try {
     '-ExecutionPolicy',
     'Bypass',
     '-File',
-    $launcherScript,
-    $configFile
+    ('"{0}"' -f $launcherScript),
+    ('"{0}"' -f $configFile)
   ) -WindowStyle Hidden -PassThru
 
   $deadline = (Get-Date).AddSeconds(10)

@@ -2,7 +2,10 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ApiKeyMutation } from '@/components/config/ApiKeysCardEditor';
-import type { ManagerConfigResponse } from '@/services/api/usageService';
+import type {
+  ManagerConfigResponse,
+  ManagerCustomPageConfig,
+} from '@/services/api/usageService';
 
 vi.mock('react-dom', () => ({
   createPortal: (children: ReactNode) => children,
@@ -101,16 +104,58 @@ vi.mock('@/components/config/VisualConfigEditor', () => ({
 vi.mock('./components/ManagerConfigPanel', () => ({
   ManagerConfigPanel: ({
     managerSaving,
+    managerRequestMonitoringEnabled,
+    managerCPABaseInput,
+    managerCPAManagementKeyInput,
+    managerCollectorMode,
+    managerPollIntervalMs,
+    managerBatchSize,
+    managerQueryLimit,
+    managerCustomPages,
+    onRequestMonitoringChange,
     onCollectorModeChange,
     onCPABaseInputChange,
     onCPAManagementKeyInputChange,
+    onPollIntervalMsChange,
+    onBatchSizeChange,
+    onQueryLimitChange,
+    onManagerCustomPagesChange,
   }: {
     managerSaving: boolean;
+    managerRequestMonitoringEnabled: boolean;
+    managerCPABaseInput: string;
+    managerCPAManagementKeyInput: string;
+    managerCollectorMode: string;
+    managerPollIntervalMs: string;
+    managerBatchSize: string;
+    managerQueryLimit: string;
+    managerCustomPages: ManagerCustomPageConfig[];
+    onRequestMonitoringChange: (value: boolean) => void;
     onCollectorModeChange: (value: string) => void;
     onCPABaseInputChange: (value: string) => void;
     onCPAManagementKeyInputChange: (value: string) => void;
+    onPollIntervalMsChange: (value: string) => void;
+    onBatchSizeChange: (value: string) => void;
+    onQueryLimitChange: (value: string) => void;
+    onManagerCustomPagesChange: (pages: ManagerCustomPageConfig[]) => void;
   }) => (
-    <div data-test="manager-panel">
+    <div
+      data-test="manager-panel"
+      data-cpa-base={managerCPABaseInput}
+      data-cpa-key={managerCPAManagementKeyInput}
+      data-monitoring-enabled={managerRequestMonitoringEnabled}
+      data-collector-mode={managerCollectorMode}
+      data-poll-interval={managerPollIntervalMs}
+      data-batch-size={managerBatchSize}
+      data-query-limit={managerQueryLimit}
+      data-custom-page-count={managerCustomPages.length}
+    >
+      <button
+        type="button"
+        data-test="manager-toggle-monitoring"
+        disabled={managerSaving}
+        onClick={() => onRequestMonitoringChange(!managerRequestMonitoringEnabled)}
+      />
       <button
         type="button"
         data-test="manager-dirty"
@@ -128,6 +173,38 @@ vi.mock('./components/ManagerConfigPanel', () => ({
         data-test="manager-change-key"
         disabled={managerSaving}
         onClick={() => onCPAManagementKeyInputChange('next-management-key')}
+      />
+      <button
+        type="button"
+        data-test="manager-change-poll"
+        disabled={managerSaving}
+        onClick={() => onPollIntervalMsChange('750')}
+      />
+      <button
+        type="button"
+        data-test="manager-change-batch"
+        disabled={managerSaving}
+        onClick={() => onBatchSizeChange('250')}
+      />
+      <button
+        type="button"
+        data-test="manager-change-custom-pages"
+        disabled={managerSaving}
+        onClick={() =>
+          onManagerCustomPagesChange([
+            {
+              id: 'status',
+              title: 'Status board',
+              url: 'https://status.example.test/overview',
+            },
+          ])
+        }
+      />
+      <button
+        type="button"
+        data-test="manager-change-query"
+        disabled={managerSaving}
+        onClick={() => onQueryLimitChange('60000')}
       />
     </div>
   ),
@@ -411,6 +488,7 @@ beforeEach(() => {
   mocks.capturedApiKeyOperationStart = null;
   mocks.capturedApiKeyOperationEnd = null;
   mocks.loadVisualValuesFromYaml.mockReturnValue({ ok: true });
+  mocks.fetchGlobalConfig.mockResolvedValue(undefined);
   mocks.applyVisualChangesToYaml.mockImplementation((yaml: string) => yaml);
   mocks.commitApiKeysText.mockImplementation((apiKeysText: string) => {
     mocks.visualState.apiKeysText = apiKeysText;
@@ -855,7 +933,7 @@ describe('ConfigPage Manager/API-key operation lock', () => {
     );
   });
 
-  it('reloads once after a successful CPA base switch', async () => {
+  it('keeps the current session and refreshes config after a successful CPA base switch', async () => {
     configureManagerMode();
     await mountPage();
     await clickTab('manager');
@@ -884,10 +962,12 @@ describe('ConfigPage Manager/API-key operation lock', () => {
     });
     await flush();
 
-    expect(mocks.reloadPage).toHaveBeenCalledTimes(1);
+    expect(mocks.reloadPage).not.toHaveBeenCalled();
+    expect(mocks.fetchGlobalConfig).toHaveBeenCalledWith(undefined, true);
+    expect(mocks.setUsageServiceConfig).toHaveBeenCalled();
   });
 
-  it('reloads after a CPA base save request fails', async () => {
+  it('keeps the current session and edited CPA base after a save request fails', async () => {
     configureManagerMode();
     await mountPage();
     await clickTab('manager');
@@ -897,11 +977,109 @@ describe('ConfigPage Manager/API-key operation lock', () => {
 
     const confirmation = getPendingConfirmation();
     await act(async () => {
-      await confirmation.onConfirm();
+      await expect(confirmation.onConfirm()).rejects.toThrow('CPA switch failed');
     });
     await flush();
 
-    expect(mocks.reloadPage).toHaveBeenCalledTimes(1);
+    expect(mocks.reloadPage).not.toHaveBeenCalled();
+    expect(
+      renderer?.root.findByProps({ 'data-test': 'manager-panel' }).props['data-cpa-base']
+    ).toBe('http://cpa-next.local:8317');
+  });
+
+  it('saves every editable Manager connection and collector field in one payload', async () => {
+    configureManagerMode();
+    await mountPage();
+    await clickTab('manager');
+
+    await click('manager-change-cpa');
+    await click('manager-change-key');
+    await click('manager-dirty');
+    await click('manager-change-poll');
+    await click('manager-change-batch');
+    await click('manager-change-query');
+    await clickSave();
+    await confirmPending();
+
+    expect(mocks.saveManagerConfig).toHaveBeenCalledWith(
+      'http://panel.local',
+      expect.objectContaining({
+        cpaConnection: {
+          cpaBaseUrl: 'http://cpa-next.local:8317',
+          managementKeyConfigured: true,
+          managementKey: 'next-management-key',
+        },
+        collector: expect.objectContaining({
+          enabled: true,
+          collectorMode: 'http',
+          pollIntervalMs: 750,
+          batchSize: 250,
+          queryLimit: 60000,
+        }),
+        externalUsageService: { enabled: false, serviceBase: '' },
+      }),
+      'management-key'
+    );
+    expect(mocks.reloadPage).not.toHaveBeenCalled();
+  });
+
+  it('persists custom page submenus through the ManagerConfig PUT', async () => {
+    configureManagerMode();
+    await mountPage();
+    await clickTab('manager');
+    await click('manager-change-custom-pages');
+    await clickSave();
+
+    expect(mocks.saveManagerConfig).toHaveBeenCalledWith(
+      'http://panel.local',
+      expect.objectContaining({
+        customPages: [
+          {
+            id: 'status',
+            title: 'Status board',
+            url: 'https://status.example.test/overview',
+          },
+        ],
+      }),
+      'management-key'
+    );
+  });
+
+  it('disables collection without resetting the saved collector tuning', async () => {
+    configureManagerMode();
+    const tunedResponse: ManagerConfigResponse = {
+      ...MANAGER_CONFIG_RESPONSE,
+      config: {
+        ...MANAGER_CONFIG_RESPONSE.config,
+        collector: {
+          ...MANAGER_CONFIG_RESPONSE.config.collector,
+          collectorMode: 'subscribe',
+          pollIntervalMs: 900,
+          batchSize: 321,
+          queryLimit: 65432,
+        },
+      },
+    };
+    mocks.getManagerConfig.mockResolvedValue(tunedResponse);
+    await mountPage();
+    await clickTab('manager');
+
+    await click('manager-toggle-monitoring');
+    await clickSave();
+
+    expect(mocks.saveManagerConfig).toHaveBeenCalledWith(
+      'http://panel.local',
+      expect.objectContaining({
+        collector: expect.objectContaining({
+          enabled: false,
+          collectorMode: 'subscribe',
+          pollIntervalMs: 900,
+          batchSize: 321,
+          queryLimit: 65432,
+        }),
+      }),
+      'management-key'
+    );
   });
 
   it('does not reload for a Management Key-only save', async () => {

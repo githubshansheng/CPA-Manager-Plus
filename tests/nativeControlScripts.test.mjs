@@ -19,13 +19,21 @@ import { afterEach, describe, expect, it } from 'vitest';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const unixControlScript = path.join(repoRoot, 'bin/native/cpa-manager-plusctl.sh');
 const windowsControlScript = path.join(repoRoot, 'bin/native/cpa-manager-plusctl.ps1');
+const windowsSourceScript = path.join(repoRoot, 'cpa-manager-plus.ps1');
+const windowsBatchScript = path.join(repoRoot, 'cpa-manager-plus.bat');
 const tempDirs = [];
 
 const findExecutable = (candidates) => candidates.find((candidate) => existsSync(candidate));
 
 const windowsPowerShell = () => {
   if (process.env.SystemRoot) {
-    return path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    return path.join(
+      process.env.SystemRoot,
+      'System32',
+      'WindowsPowerShell',
+      'v1.0',
+      'powershell.exe'
+    );
   }
   return 'powershell.exe';
 };
@@ -50,11 +58,15 @@ const runPowerShell = (args, options = {}) =>
 
 const runPowerShellControl = (env, args, options = {}) => {
   try {
-    return execFileSync(windowsPowerShell(), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', windowsControlScript, ...args], {
-      env,
-      encoding: 'utf8',
-      ...options,
-    });
+    return execFileSync(
+      windowsPowerShell(),
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', windowsControlScript, ...args],
+      {
+        env,
+        encoding: 'utf8',
+        ...options,
+      }
+    );
   } catch (error) {
     throw new Error(
       [
@@ -65,7 +77,7 @@ const runPowerShellControl = (env, args, options = {}) => {
         error.message,
       ]
         .filter(Boolean)
-        .join('\n\n'),
+        .join('\n\n')
     );
   }
 };
@@ -77,7 +89,7 @@ const spawnPowerShellControl = (env, args) => {
     {
       env,
       encoding: 'utf8',
-    },
+    }
   );
   if (result.status !== 0) {
     throw new Error(
@@ -88,7 +100,7 @@ const spawnPowerShellControl = (env, args) => {
         result.stderr ? `stderr:\n${result.stderr}` : '',
       ]
         .filter(Boolean)
-        .join('\n\n'),
+        .join('\n\n')
     );
   }
 };
@@ -128,7 +140,7 @@ describe('native control scripts', () => {
         'printf "%s\\n" "${USAGE_DATA_DIR:-}" >"${CPA_MANAGER_PLUS_TEST_DATA_FILE}"',
         'sleep 30',
         '',
-      ].join('\n'),
+      ].join('\n')
     );
     chmodSync(fakeBinary, 0o755);
 
@@ -144,7 +156,9 @@ describe('native control scripts', () => {
 
       expect(readFileSync(cwdFile, 'utf8').trim()).toBe(packageDir);
       expect(readFileSync(dataEnvFile, 'utf8').trim()).toBe('./data');
-      expect(runUnixControl(controlScript, env, ['status'], { cwd: callerDir })).toContain('is running with PID');
+      expect(runUnixControl(controlScript, env, ['status'], { cwd: callerDir })).toContain(
+        'is running with PID'
+      );
       expect(runUnixControl(controlScript, env, ['stop'], { cwd: callerDir })).toContain('stopped');
     } finally {
       spawnSync('bash', [controlScript, 'stop'], { cwd: callerDir, env, encoding: 'utf8' });
@@ -441,7 +455,25 @@ describe('native control scripts', () => {
     }
   });
 
-  it('parses the Windows PowerShell control script', () => {
+  it('parses the Windows PowerShell control and source scripts', () => {
+    if (process.platform !== 'win32') {
+      return;
+    }
+
+    runPowerShell([
+      '-Command',
+      [
+        `foreach ($path in @(${psQuote(windowsControlScript)}, ${psQuote(windowsSourceScript)})) {`,
+        '  $tokens = $null',
+        '  $errors = $null',
+        '  [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors) | Out-Null',
+        '  if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error "${path}: $($_.Message)" }; exit 1 }',
+        '}',
+      ].join('; '),
+    ]);
+  }, 10_000);
+
+  it('treats omitted Windows source runtime arguments as the default start action', () => {
     if (process.platform !== 'win32') {
       return;
     }
@@ -451,8 +483,132 @@ describe('native control scripts', () => {
       [
         '$tokens = $null',
         '$errors = $null',
-        `[System.Management.Automation.Language.Parser]::ParseFile(${psQuote(windowsControlScript)}, [ref]$tokens, [ref]$errors) | Out-Null`,
-        'if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }',
+        `$ast = [System.Management.Automation.Language.Parser]::ParseFile(${psQuote(windowsSourceScript)}, [ref]$tokens, [ref]$errors)`,
+        "$functionAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Parse-Arguments' }, $true)",
+        "if (-not $functionAst) { throw 'Parse-Arguments function not found' }",
+        'Invoke-Expression $functionAst.Extent.Text',
+        '$ScriptArguments = $null',
+        "$Action = 'start'",
+        '$ActionArguments = @()',
+        '$RequestedPort = $null',
+        'Parse-Arguments',
+        'if ($Action -ne \'start\') { throw "Unexpected default action: $Action" }',
+      ].join('; '),
+    ]);
+  }, 10_000);
+
+  it('requires authenticated business-data readiness for Windows source startup', () => {
+    if (process.platform !== 'win32') {
+      return;
+    }
+
+    const source = readFileSync(windowsSourceScript, 'utf8');
+    expect(source).toContain("Authorization = 'Bearer ' + (Get-EffectiveAdminKey)");
+    expect(source).toContain("Get-ServiceURL -Port $Port -Path '/status'");
+    expect(source).toContain("Get-ServiceURL -Port $Port -Path '/usage-service/config'");
+    expect(source).toContain('Assert-NormalDatabaseMode -StatusJSON $statusResponse.Content');
+    expect(source).toContain('Wait-ForReady -Port $Port');
+    expect(source).toContain('go test ./internal/outboxcontext ./internal/repository/sqlite');
+
+    runPowerShell([
+      '-Command',
+      [
+        '$tokens = $null',
+        '$errors = $null',
+        `$ast = [System.Management.Automation.Language.Parser]::ParseFile(${psQuote(windowsSourceScript)}, [ref]$tokens, [ref]$errors)`,
+        "$functionAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-NormalDatabaseMode' }, $true)",
+        "if (-not $functionAst) { throw 'Assert-NormalDatabaseMode function not found' }",
+        'Invoke-Expression $functionAst.Extent.Text',
+        "$statusJSON = [pscustomobject]@{ service = 'manager'; recoveryMode = $false } | ConvertTo-Json -Compress",
+        "Assert-NormalDatabaseMode -StatusJSON $statusJSON -StatusURL 'http://127.0.0.1:18317/status'",
+      ].join('; '),
+    ]);
+  }, 10_000);
+
+  it('fails Windows readiness immediately when the managed process exits', () => {
+    if (process.platform !== 'win32') {
+      return;
+    }
+
+    runPowerShell([
+      '-Command',
+      [
+        '$tokens = $null',
+        '$errors = $null',
+        `$ast = [System.Management.Automation.Language.Parser]::ParseFile(${psQuote(windowsSourceScript)}, [ref]$tokens, [ref]$errors)`,
+        "$functionAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Wait-ForReady' }, $true)",
+        "if (-not $functionAst) { throw 'Wait-ForReady function not found' }",
+        'Invoke-Expression $functionAst.Extent.Text',
+        "function Get-HealthURL { param([int]$Port) return 'http://127.0.0.1/health' }",
+        'function Test-SourceRunning { return $false }',
+        "$ServiceErrorLogFile = 'manager.err.log'",
+        '$timer = [System.Diagnostics.Stopwatch]::StartNew()',
+        '$failed = $false',
+        'try { Wait-ForReady -Port 18317 -TimeoutSeconds 60 } catch {',
+        "  if (-not $_.Exception.Message.StartsWith('Service process exited before readiness checks completed')) { throw }",
+        '  $failed = $true',
+        '}',
+        '$timer.Stop()',
+        "if (-not $failed) { throw 'Stopped service was accepted as ready' }",
+        "if ($timer.Elapsed.TotalSeconds -ge 5) { throw 'Stopped service did not fail quickly' }",
+      ].join('; '),
+    ]);
+  }, 10_000);
+
+  it('logs failed Windows batch startups and supports non-interactive callers', () => {
+    if (process.platform !== 'win32') {
+      return;
+    }
+
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), 'cpamp-batch-startup-'));
+    tempDirs.push(tempDir);
+    const startupLog = path.join(tempDir, 'startup.log');
+    const result = spawnSync(
+      process.env.ComSpec || 'cmd.exe',
+      ['/d', '/c', 'call', windowsBatchScript, 'start', '--port', 'invalid'],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          CPA_MANAGER_PLUS_NO_PAUSE: '1',
+          CPA_MANAGER_PLUS_STARTUP_LOG: startupLog,
+        },
+        encoding: 'utf8',
+      }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('CPA Manager Plus failed to start with exit code 1');
+    expect(readFileSync(startupLog, 'utf8')).toContain(
+      '--port must be an integer between 1 and 65535'
+    );
+
+    const batchSource = readFileSync(windowsBatchScript, 'utf8');
+    expect(batchSource).toContain('CPA_MANAGER_PLUS_NO_PAUSE');
+    expect(batchSource).toContain('pause');
+  }, 10_000);
+
+  it('rejects Windows source startup when status reports database recovery mode', () => {
+    if (process.platform !== 'win32') {
+      return;
+    }
+
+    runPowerShell([
+      '-Command',
+      [
+        '$tokens = $null',
+        '$errors = $null',
+        `$ast = [System.Management.Automation.Language.Parser]::ParseFile(${psQuote(windowsSourceScript)}, [ref]$tokens, [ref]$errors)`,
+        "$functionAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-NormalDatabaseMode' }, $true)",
+        "if (-not $functionAst) { throw 'Assert-NormalDatabaseMode function not found' }",
+        'Invoke-Expression $functionAst.Extent.Text',
+        '$statusJSON = [pscustomobject]@{ recoveryMode = $true } | ConvertTo-Json -Compress',
+        '$rejected = $false',
+        "try { Assert-NormalDatabaseMode -StatusJSON $statusJSON -StatusURL 'http://127.0.0.1:18317/status' } catch {",
+        "  if (-not $_.Exception.Message.StartsWith('Service entered database recovery mode')) { throw }",
+        '  $rejected = $true',
+        '}',
+        "if (-not $rejected) { throw 'Recovery mode was accepted as ready' }",
       ].join('; '),
     ]);
   }, 10_000);
@@ -462,7 +618,7 @@ describe('native control scripts', () => {
       return;
     }
 
-    const tempDir = mkdtempSync(path.join(os.tmpdir(), 'cpamp-native-win-'));
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), 'cpamp native win '));
     tempDirs.push(tempDir);
 
     const pidFile = path.join(tempDir, 'custom-run', 'nested', 'manager.pid');
@@ -510,17 +666,89 @@ describe('native control scripts', () => {
         {
           env,
           encoding: 'utf8',
-        },
+        }
       );
       expect(invalidLogsResult.status).not.toBe(0);
       expect(invalidLogsResult.stderr).toContain('Invalid log line count');
       expect(runPowerShellControl(env, ['stop'])).toContain('stopped');
       expect(existsSync(pidFile)).toBe(false);
     } finally {
-      spawnSync(windowsPowerShell(), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', windowsControlScript, 'stop'], {
-        env,
-        encoding: 'utf8',
-      });
+      spawnSync(
+        windowsPowerShell(),
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', windowsControlScript, 'stop'],
+        {
+          env,
+          encoding: 'utf8',
+        }
+      );
+    }
+  }, 30000);
+
+  it('reclaims a reused Windows PID record without stopping the unrelated process', () => {
+    if (process.platform !== 'win32') {
+      return;
+    }
+
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), 'cpamp-native-win-reused-pid-'));
+    tempDirs.push(tempDir);
+
+    const pidFile = path.join(tempDir, 'run', 'manager.pid');
+    const logFile = path.join(tempDir, 'logs', 'manager.log');
+    const errLogFile = path.join(tempDir, 'logs', 'manager.err.log');
+    const childScript = path.join(tempDir, 'managed-child.js');
+    writeFileSync(childScript, 'setTimeout(() => {}, 30000);\r\n');
+
+    const unrelatedProcess = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      stdio: 'ignore',
+    });
+    expect(unrelatedProcess.pid).toBeGreaterThan(0);
+
+    const env = {
+      ...process.env,
+      CPA_MANAGER_PLUS_BIN: process.execPath,
+      CPA_MANAGER_PLUS_PID_FILE: pidFile,
+      CPA_MANAGER_PLUS_LOG_FILE: logFile,
+      CPA_MANAGER_PLUS_ERR_LOG_FILE: errLogFile,
+    };
+
+    try {
+      mkdirSync(path.dirname(pidFile), { recursive: true });
+      writeFileSync(
+        pidFile,
+        JSON.stringify({
+          pid: unrelatedProcess.pid,
+          startTimeUtc: '2000-01-01T00:00:00.0000000Z',
+          binaryPath: process.execPath,
+          commandLine: 'unrelated test process',
+        })
+      );
+
+      const staleStatus = spawnSync(
+        windowsPowerShell(),
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', windowsControlScript, 'status'],
+        { env, encoding: 'utf8' }
+      );
+      expect(staleStatus.status).not.toBe(0);
+      expect(staleStatus.stdout).toContain('stale PID file');
+
+      spawnPowerShellControl(env, ['start', childScript]);
+
+      const managedRecord = JSON.parse(readFileSync(pidFile, 'utf8'));
+      expect(managedRecord.pid).not.toBe(unrelatedProcess.pid);
+      expect(() => process.kill(unrelatedProcess.pid, 0)).not.toThrow();
+      expect(runPowerShellControl(env, ['status'])).toContain('is running with PID');
+      expect(runPowerShellControl(env, ['stop'])).toContain('stopped');
+      expect(() => process.kill(unrelatedProcess.pid, 0)).not.toThrow();
+    } finally {
+      spawnSync(
+        windowsPowerShell(),
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', windowsControlScript, 'stop'],
+        {
+          env,
+          encoding: 'utf8',
+        }
+      );
+      unrelatedProcess.kill();
     }
   }, 30000);
 
@@ -570,7 +798,7 @@ describe('native control scripts', () => {
           CPA_MANAGER_PLUS_PID_FILE: path.join(unsafeDir, 'manager.pid'),
         },
         encoding: 'utf8',
-      },
+      }
     );
 
     expect(result.status).not.toBe(0);
@@ -605,7 +833,7 @@ describe('native control scripts', () => {
         {
           env,
           encoding: 'utf8',
-        },
+        }
       );
 
       expect(result.status).not.toBe(0);
@@ -651,7 +879,7 @@ describe('native control scripts', () => {
         {
           env,
           encoding: 'utf8',
-        },
+        }
       );
 
       expect(result.status).not.toBe(0);

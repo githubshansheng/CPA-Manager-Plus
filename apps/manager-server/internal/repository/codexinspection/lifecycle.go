@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/outboxcontext"
 	modernsqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -26,6 +27,22 @@ const (
 // reads are left untouched so a transient lock does not turn into unbounded
 // query latency throughout the application.
 func withSQLiteBusyRetry(ctx context.Context, operation func() error) error {
+	return withDatabaseWriteRetry(ctx, isSQLiteBusyError, operation)
+}
+
+func (r *repository) withWriteRetry(ctx context.Context, operation func() error) error {
+	retryable := isSQLiteBusyError
+	if r.dialect.IsMySQL() {
+		retryable = r.dialect.IsRetryableWriteConflict
+	}
+	return withDatabaseWriteRetry(ctx, retryable, operation)
+}
+
+func withDatabaseWriteRetry(
+	ctx context.Context,
+	retryable func(error) bool,
+	operation func() error,
+) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -35,7 +52,7 @@ func withSQLiteBusyRetry(ctx context.Context, operation func() error) error {
 			return err
 		}
 		lastErr = operation()
-		if lastErr == nil || !isSQLiteBusyError(lastErr) || attempt == maxLifecycleBusyRetries {
+		if lastErr == nil || !retryable(lastErr) || attempt == maxLifecycleBusyRetries {
 			return lastErr
 		}
 		backoff := time.Duration(1<<attempt) * 10 * time.Millisecond
@@ -48,6 +65,14 @@ func withSQLiteBusyRetry(ctx context.Context, operation func() error) error {
 		}
 	}
 	return lastErr
+}
+
+func (r *repository) beginWriteTx(ctx context.Context) (*outboxcontext.Tx, error) {
+	var options *sql.TxOptions
+	if r.dialect.IsMySQL() {
+		options = &sql.TxOptions{Isolation: sql.LevelSerializable}
+	}
+	return outboxcontext.Begin(ctx, r.db, options)
 }
 
 func stopSQLiteRetryTimer(timer *time.Timer) {
@@ -99,7 +124,7 @@ func (r *repository) AcquireRun(
 	run.Status = model.CodexInspectionStatusRunning
 	run.FinishedAtMS = 0
 	run.Error = ""
-	err = withSQLiteBusyRetry(ctx, func() error {
+	err = r.withWriteRetry(ctx, func() error {
 		attemptResult, attemptErr := r.acquireRunOnce(ctx, run, ownerID, leaseDuration)
 		if attemptErr == nil {
 			result = attemptResult
@@ -115,13 +140,12 @@ func (r *repository) acquireRunOnce(
 	ownerID string,
 	leaseDuration time.Duration,
 ) (AcquireRunResult, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := r.beginWriteTx(ctx)
 	if err != nil {
 		return AcquireRunResult{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	now := time.Now().UnixMilli()
 	leaseDurationMS := leaseDuration.Milliseconds()
 	if leaseDurationMS <= 0 {
 		leaseDurationMS = 1
@@ -130,7 +154,7 @@ func (r *repository) acquireRunOnce(
 	var existingRunID sql.NullInt64
 	reclaimTerminalLease := false
 	err = tx.QueryRowContext(ctx, `select run_id, owner_id, heartbeat_at_ms, lease_expires_at_ms
-		from codex_inspection_leases where id = 1`).Scan(
+		from codex_inspection_leases where id = 1`+r.dialect.ForUpdate()).Scan(
 		&existingRunID,
 		&existing.OwnerID,
 		&existing.HeartbeatAtMS,
@@ -138,6 +162,10 @@ func (r *repository) acquireRunOnce(
 	)
 	hasLease := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return AcquireRunResult{}, err
+	}
+	var now int64
+	if err := tx.QueryRowContext(ctx, `select `+r.dialect.NowMillisExpression()).Scan(&now); err != nil {
 		return AcquireRunResult{}, err
 	}
 	if hasLease {
@@ -151,7 +179,7 @@ func (r *repository) acquireRunOnce(
 			// every future inspection until the old lease timeout. Only an
 			// unexpired lease bound to an active run fences a new acquisition.
 			var existingStatus string
-			if statusErr := tx.QueryRowContext(ctx, `select status from codex_inspection_runs where id = ?`, existing.RunID).Scan(&existingStatus); statusErr == nil {
+			if statusErr := tx.QueryRowContext(ctx, `select status from codex_inspection_runs where id = ?`+r.dialect.ForUpdate(), existing.RunID).Scan(&existingStatus); statusErr == nil {
 				if model.IsCodexInspectionRunActive(existingStatus) {
 					return AcquireRunResult{}, ErrLeaseAlreadyActive
 				}
@@ -168,7 +196,7 @@ func (r *repository) acquireRunOnce(
 	if hasLease && existing.RunID > 0 {
 		var oldStatus string
 		var oldStarted int64
-		if err := tx.QueryRowContext(ctx, `select status, started_at_ms from codex_inspection_runs where id = ?`, existing.RunID).Scan(&oldStatus, &oldStarted); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRowContext(ctx, `select status, started_at_ms from codex_inspection_runs where id = ?`+r.dialect.ForUpdate(), existing.RunID).Scan(&oldStatus, &oldStarted); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return AcquireRunResult{}, err
 		} else if err == nil && model.IsCodexInspectionRunActive(oldStatus) {
 			finished := now
@@ -213,18 +241,19 @@ func (r *repository) acquireRunOnce(
 		}
 	}
 
-	// Compute the claim timestamp inside SQLite after any writer-lock wait. A Go
-	// timestamp captured before sqlite3_step could make the freshly acquired
+	// Compute the claim timestamp inside the database after any writer-lock wait.
+	// A Go timestamp captured before the statement could make the freshly acquired
 	// lease substantially shorter than the Service believes it is.
+	nowSQL := r.dialect.NowMillisExpression()
 	if hasLease {
 		res, err := tx.ExecContext(ctx, `update codex_inspection_leases set
 			run_id = null,
 			owner_id = ?,
-			heartbeat_at_ms = cast(unixepoch('subsec') * 1000 as integer),
-			lease_expires_at_ms = cast(unixepoch('subsec') * 1000 as integer) + ?
+			heartbeat_at_ms = `+nowSQL+`,
+			lease_expires_at_ms = `+nowSQL+` + ?
 			where id = 1 and (
 				run_id is null or run_id <= 0 or
-				lease_expires_at_ms <= cast(unixepoch('subsec') * 1000 as integer) or
+				lease_expires_at_ms <= `+nowSQL+` or
 				? = 1
 			)`, ownerID, leaseDurationMS, boolAsInt(reclaimTerminalLease))
 		if err != nil {
@@ -233,6 +262,17 @@ func (r *repository) acquireRunOnce(
 		changed, err := res.RowsAffected()
 		if err != nil {
 			return AcquireRunResult{}, err
+		}
+		if changed == 0 && r.dialect.IsMySQL() {
+			var matched int
+			if err := tx.QueryRowContext(ctx, `select count(*) from codex_inspection_leases
+				where id = 1 and run_id is null and owner_id = ?
+				and lease_expires_at_ms > `+nowSQL, ownerID).Scan(&matched); err != nil {
+				return AcquireRunResult{}, err
+			}
+			if matched == 1 {
+				changed = 1
+			}
 		}
 		if changed != 1 {
 			return AcquireRunResult{}, ErrLeaseAlreadyActive
@@ -244,9 +284,9 @@ func (r *repository) acquireRunOnce(
 			1,
 			null,
 			?,
-			cast(unixepoch('subsec') * 1000 as integer),
-			cast(unixepoch('subsec') * 1000 as integer) + ?
-		) on conflict(id) do nothing`, ownerID, leaseDurationMS)
+			`+nowSQL+`,
+			`+nowSQL+` + ?
+		)`+r.dialect.InsertDoNothingClause([]string{"id"}, "id"), ownerID, leaseDurationMS)
 		if err != nil {
 			return AcquireRunResult{}, err
 		}
@@ -275,7 +315,7 @@ func (r *repository) acquireRunOnce(
 	triggerKey := strings.TrimSpace(run.TriggerKey)
 	if triggerType == model.CodexInspectionTriggerScheduled && triggerKey != "" {
 		var existingTriggerID int64
-		err := tx.QueryRowContext(ctx, `select id from codex_inspection_runs where trigger_type = ? and trigger_key = ? limit 1`, triggerType, triggerKey).Scan(&existingTriggerID)
+		err := tx.QueryRowContext(ctx, `select id from codex_inspection_runs where trigger_type = ? and trigger_key = ? limit 1`+r.dialect.ForUpdate(), triggerType, triggerKey).Scan(&existingTriggerID)
 		if err == nil {
 			if _, deleteErr := tx.ExecContext(ctx, `delete from codex_inspection_leases where id = 1 and owner_id = ?`, ownerID); deleteErr != nil {
 				return AcquireRunResult{}, deleteErr
@@ -292,19 +332,21 @@ func (r *repository) acquireRunOnce(
 	}
 
 	prepared := prepareRun(run, claimNow)
-	var runID int64
-	err = tx.QueryRowContext(ctx, `insert into codex_inspection_runs (
+	res, err := tx.ExecContext(ctx, `insert into codex_inspection_runs (
 		trigger_type, trigger_key, status, started_at_ms, finished_at_ms,
 		total_files, probe_set_count, sampled_count, disabled_count, enabled_count,
 		delete_count, disable_count, enable_count, reauth_count, keep_count, error,
 		settings_json, created_at_ms, updated_at_ms
-	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	returning id`,
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		prepared.TriggerType, nullString(prepared.TriggerKey), prepared.Status, prepared.StartedAtMS, nullPositiveInt64(prepared.FinishedAtMS),
 		prepared.TotalFiles, prepared.ProbeSetCount, prepared.SampledCount, prepared.DisabledCount, prepared.EnabledCount,
 		prepared.DeleteCount, prepared.DisableCount, prepared.EnableCount, prepared.ReauthCount, prepared.KeepCount,
 		nullString(prepared.Error), prepared.SettingsJSON, prepared.CreatedAtMS, prepared.UpdatedAtMS,
-	).Scan(&runID)
+	)
+	if err != nil {
+		return AcquireRunResult{}, err
+	}
+	runID, err := res.LastInsertId()
 	if err != nil {
 		return AcquireRunResult{}, err
 	}
@@ -379,20 +421,21 @@ func (r *repository) HeartbeatRun(ctx context.Context, runID int64, ownerID stri
 	if leaseDuration <= 0 {
 		leaseDuration = defaultInspectionLeaseDuration
 	}
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		leaseDurationMS := leaseDuration.Milliseconds()
 		if leaseDurationMS <= 0 {
 			leaseDurationMS = 1
 		}
-		// Compute the timestamp inside SQLite after any writer-lock wait. A Go
-		// timestamp captured before sqlite3_step could otherwise resurrect an
+		// Compute the timestamp inside the database after any writer-lock wait. A
+		// Go timestamp captured before the statement could otherwise resurrect an
 		// already expired lease or return with substantially less lifetime than the
 		// heartbeat loop believes it renewed.
-		res, err := r.db.ExecContext(ctx, `update codex_inspection_leases set
-			heartbeat_at_ms = cast(unixepoch('subsec') * 1000 as integer),
-			lease_expires_at_ms = cast(unixepoch('subsec') * 1000 as integer) + ?
+		nowSQL := r.dialect.NowMillisExpression()
+		res, err := outboxcontext.Exec(ctx, r.db, `update codex_inspection_leases set
+			heartbeat_at_ms = `+nowSQL+`,
+			lease_expires_at_ms = `+nowSQL+` + ?
 			where id = 1 and run_id = ? and owner_id = ?
-			and lease_expires_at_ms > cast(unixepoch('subsec') * 1000 as integer)
+			and lease_expires_at_ms > `+nowSQL+`
 			and exists (
 			select 1 from codex_inspection_runs where id = ? and status in (?, ?)
 		)`, leaseDurationMS, runID, ownerID, runID, model.CodexInspectionStatusRunning, model.CodexInspectionStatusCancelling)
@@ -402,6 +445,19 @@ func (r *repository) HeartbeatRun(ctx context.Context, runID int64, ownerID stri
 		changed, err := res.RowsAffected()
 		if err != nil {
 			return err
+		}
+		if changed == 0 && r.dialect.IsMySQL() {
+			var matched int
+			if err := r.db.QueryRowContext(ctx, `select count(*) from codex_inspection_leases l
+				join codex_inspection_runs r on r.id = l.run_id and r.status in (?, ?)
+				where l.id = 1 and l.run_id = ? and l.owner_id = ? and l.lease_expires_at_ms > `+nowSQL,
+				model.CodexInspectionStatusRunning, model.CodexInspectionStatusCancelling,
+				runID, ownerID).Scan(&matched); err != nil {
+				return err
+			}
+			if matched == 1 {
+				return nil
+			}
 		}
 		if changed != 1 {
 			return ErrLeaseLost
@@ -418,9 +474,9 @@ func (r *repository) UpdateRunProgress(ctx context.Context, run model.CodexInspe
 	if run.SettingsJSON == "" {
 		run.SettingsJSON = model.MarshalCodexInspectionSettings(run.Settings)
 	}
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		now := time.Now().UnixMilli()
-		res, err := r.db.ExecContext(ctx, `update codex_inspection_runs set
+		res, err := outboxcontext.Exec(ctx, r.db, `update codex_inspection_runs set
 			total_files = ?, probe_set_count = ?, sampled_count = ?, disabled_count = ?, enabled_count = ?,
 			delete_count = ?, disable_count = ?, enable_count = ?, reauth_count = ?, keep_count = ?,
 			settings_json = ?, updated_at_ms = ?
@@ -454,6 +510,20 @@ func (r *repository) UpdateRunProgress(ctx context.Context, run model.CodexInspe
 		if err != nil {
 			return err
 		}
+		if changed == 0 && r.dialect.IsMySQL() {
+			var matched int
+			if err := r.db.QueryRowContext(ctx, `select count(*) from codex_inspection_runs r
+				join codex_inspection_leases l on l.run_id = r.id and l.id = 1
+				where r.id = ? and r.status in (?, ?) and l.owner_id = ?
+				and l.lease_expires_at_ms > `+r.dialect.NowMillisExpression(),
+				run.ID, model.CodexInspectionStatusRunning, model.CodexInspectionStatusCancelling,
+				ownerID).Scan(&matched); err != nil {
+				return err
+			}
+			if matched == 1 {
+				return nil
+			}
+		}
 		if changed != 1 {
 			return ErrLeaseLost
 		}
@@ -461,24 +531,47 @@ func (r *repository) UpdateRunProgress(ctx context.Context, run model.CodexInspe
 	})
 }
 
+// lockLeaseTx establishes the global lifecycle lock before a run row is
+// changed. MySQL needs the explicit row/range lock; SQLite's immediate write
+// transaction already serializes the same critical section.
+func (r *repository) lockLeaseTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	runID int64,
+	ownerID string,
+	requireUnexpired bool,
+) (int64, error) {
+	var leaseRunID sql.NullInt64
+	var leaseExpiresAtMS int64
+	if err := tx.QueryRowContext(ctx, `select run_id, lease_expires_at_ms
+		from codex_inspection_leases where id = 1 and owner_id = ?`+r.dialect.ForUpdate(),
+		ownerID).Scan(&leaseRunID, &leaseExpiresAtMS); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrLeaseLost
+		}
+		return 0, err
+	}
+	var now int64
+	if err := tx.QueryRowContext(ctx, `select `+r.dialect.NowMillisExpression()).Scan(&now); err != nil {
+		return 0, err
+	}
+	if !leaseRunID.Valid || leaseRunID.Int64 != runID || requireUnexpired && leaseExpiresAtMS <= now {
+		return 0, ErrLeaseLost
+	}
+	return now, nil
+}
+
 func (r *repository) MarkRunCancelling(ctx context.Context, runID int64, ownerID string, reason string) (bool, error) {
 	var changed bool
-	err := withSQLiteBusyRetry(ctx, func() error {
-		tx, err := r.db.BeginTx(ctx, nil)
+	err := r.withWriteRetry(ctx, func() error {
+		tx, err := r.beginWriteTx(ctx)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		now := time.Now().UnixMilli()
-		var leaseRunID sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `select run_id from codex_inspection_leases where id = 1 and owner_id = ? and lease_expires_at_ms > ?`, ownerID, now).Scan(&leaseRunID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return ErrLeaseLost
-			}
+		now, err := r.lockLeaseTx(ctx, tx.Tx, runID, ownerID, true)
+		if err != nil {
 			return err
-		}
-		if !leaseRunID.Valid || leaseRunID.Int64 != runID {
-			return ErrLeaseLost
 		}
 		res, err := tx.ExecContext(ctx, `update codex_inspection_runs set status = ?, error = case when ? <> '' then ? else error end, updated_at_ms = ? where id = ? and status = ? and exists (
 			select 1 from codex_inspection_leases
@@ -512,23 +605,27 @@ func (r *repository) MarkRunCancelling(ctx context.Context, runID int64, ownerID
 }
 
 func (r *repository) FinalizeRun(ctx context.Context, run model.CodexInspectionRun, ownerID string, finalLog *model.CodexInspectionLog) error {
-	return withSQLiteBusyRetry(ctx, func() error {
-		tx, err := r.db.BeginTx(ctx, nil)
+	return r.withWriteRetry(ctx, func() error {
+		tx, err := r.beginWriteTx(ctx)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		effectiveStatus, effectiveError, err := finalizeRunTx(ctx, tx, run, ownerID)
+		now, err := r.lockLeaseTx(ctx, tx.Tx, run.ID, ownerID, true)
+		if err != nil {
+			return err
+		}
+		effectiveStatus, effectiveError, err := finalizeRunTx(ctx, tx.Tx, run, ownerID)
 		if err != nil {
 			return err
 		}
 		if finalLog != nil {
 			normalizedLog := normalizeFinalLifecycleLog(*finalLog, effectiveStatus, effectiveError)
-			if _, err := insertLogTx(ctx, tx, normalizedLog); err != nil {
+			if _, err := insertLogTx(ctx, tx.Tx, normalizedLog); err != nil {
 				return err
 			}
 		}
-		res, err := tx.ExecContext(ctx, `delete from codex_inspection_leases where id = 1 and run_id = ? and owner_id = ? and lease_expires_at_ms > ?`, run.ID, ownerID, time.Now().UnixMilli())
+		res, err := tx.ExecContext(ctx, `delete from codex_inspection_leases where id = 1 and run_id = ? and owner_id = ? and lease_expires_at_ms > ?`, run.ID, ownerID, now)
 		if err != nil {
 			return err
 		}
@@ -557,7 +654,7 @@ func (r *repository) ForceFinalizeRun(ctx context.Context, run model.CodexInspec
 	if run.ID <= 0 || strings.TrimSpace(ownerID) == "" {
 		return ErrLeaseLost
 	}
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		return r.forceFinalizeRunOnce(ctx, run, ownerID, finalLog)
 	})
 	if err == nil || errors.Is(err, ErrLeaseLost) || finalLog == nil {
@@ -566,17 +663,20 @@ func (r *repository) ForceFinalizeRun(ctx context.Context, run model.CodexInspec
 	// A lifecycle log is useful but must never strand the terminal state. Retry
 	// the same fenced transition without the optional log when its insert was
 	// the failing write.
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		return r.forceFinalizeRunOnce(ctx, run, ownerID, nil)
 	})
 }
 
 func (r *repository) forceFinalizeRunOnce(ctx context.Context, run model.CodexInspectionRun, ownerID string, finalLog *model.CodexInspectionLog) error {
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := r.beginWriteTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := r.lockLeaseTx(ctx, tx.Tx, run.ID, ownerID, false); err != nil {
+		return err
+	}
 
 	now := time.Now().UnixMilli()
 	run = prepareRun(run, now)
@@ -587,18 +687,22 @@ func (r *repository) forceFinalizeRunOnce(ctx context.Context, run model.CodexIn
 	if !isTerminalStatus(run.Status) {
 		return ErrInvalidFinalStatus
 	}
+	// MySQL evaluates single-table UPDATE assignments from left to right. Keep
+	// the cancellation reason calculation before changing status so it observes
+	// the fenced pre-update state, matching SQLite's snapshot semantics.
 	res, err := tx.ExecContext(ctx, `update codex_inspection_runs set
+		error = case when status = ? then coalesce(nullif(error, ''), ?) else ? end,
 		status = case when status = ? then ? else ? end, finished_at_ms = ?, total_files = ?, probe_set_count = ?, sampled_count = ?,
 		disabled_count = ?, enabled_count = ?, delete_count = ?, disable_count = ?, enable_count = ?,
-		reauth_count = ?, keep_count = ?, error = case when status = ? then coalesce(nullif(error, ''), ?) else ? end, settings_json = ?, updated_at_ms = ?
+		reauth_count = ?, keep_count = ?, settings_json = ?, updated_at_ms = ?
 		where id = ? and status in (?, ?) and exists (
 			select 1 from codex_inspection_leases where id = 1 and owner_id = ? and run_id = ?
 		)`,
+		model.CodexInspectionStatusCancelling, userCancelledFallbackReason, nullString(run.Error),
 		model.CodexInspectionStatusCancelling, model.CodexInspectionStatusCancelled, run.Status,
 		nullPositiveInt64(run.FinishedAtMS), run.TotalFiles, run.ProbeSetCount,
 		run.SampledCount, run.DisabledCount, run.EnabledCount, run.DeleteCount, run.DisableCount, run.EnableCount,
-		run.ReauthCount, run.KeepCount,
-		model.CodexInspectionStatusCancelling, userCancelledFallbackReason, nullString(run.Error), run.SettingsJSON, run.UpdatedAtMS, run.ID,
+		run.ReauthCount, run.KeepCount, run.SettingsJSON, run.UpdatedAtMS, run.ID,
 		model.CodexInspectionStatusRunning, model.CodexInspectionStatusCancelling, ownerID, run.ID)
 	if err != nil {
 		return err
@@ -610,13 +714,13 @@ func (r *repository) forceFinalizeRunOnce(ctx context.Context, run model.CodexIn
 	if changed != 1 {
 		return ErrLeaseLost
 	}
-	effectiveStatus, effectiveError, err := loadFinalRunStateTx(ctx, tx, run.ID)
+	effectiveStatus, effectiveError, err := loadFinalRunStateTx(ctx, tx.Tx, run.ID)
 	if err != nil {
 		return err
 	}
 	if finalLog != nil {
 		normalizedLog := normalizeFinalLifecycleLog(*finalLog, effectiveStatus, effectiveError)
-		if _, err := insertLogTx(ctx, tx, normalizedLog); err != nil {
+		if _, err := insertLogTx(ctx, tx.Tx, normalizedLog); err != nil {
 			return err
 		}
 	}
@@ -657,13 +761,17 @@ func (r *repository) RecoverStaleRuns(ctx context.Context, nowMS int64, reason s
 		reason = "服务重启或任务租约过期，巡检已中断"
 	}
 	var recovered []model.CodexInspectionRun
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		recovered = recovered[:0]
-		tx, err := r.db.BeginTx(ctx, nil)
+		tx, err := r.beginWriteTx(ctx)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
+		var lockedLeaseID int64
+		if err := tx.QueryRowContext(ctx, `select id from codex_inspection_leases where id = 1`+r.dialect.ForUpdate()).Scan(&lockedLeaseID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 		// An unbound lease is only an incomplete acquisition. It is never a
 		// valid active task and must not block recovery or the next run after a
 		// crash between lease creation and run binding.
@@ -674,7 +782,7 @@ func (r *repository) RecoverStaleRuns(ctx context.Context, nowMS int64, reason s
 		}
 		rows, err := tx.QueryContext(ctx, `select r.id, r.status, r.started_at_ms, coalesce(l.run_id, 0), coalesce(l.lease_expires_at_ms, 0)
 			from codex_inspection_runs r left join codex_inspection_leases l on l.run_id = r.id
-			where r.status in (?, ?)`, model.CodexInspectionStatusRunning, model.CodexInspectionStatusCancelling)
+			where r.status in (?, ?)`+r.dialect.ForUpdate(), model.CodexInspectionStatusRunning, model.CodexInspectionStatusCancelling)
 		if err != nil {
 			return err
 		}
@@ -777,8 +885,8 @@ func finalizeRunTx(ctx context.Context, tx *sql.Tx, run model.CodexInspectionRun
 			finished_at_ms = ?, total_files = ?, probe_set_count = ?, sampled_count = ?,
 			disabled_count = ?, enabled_count = ?, delete_count = ?, disable_count = ?, enable_count = ?,
 			reauth_count = ?, keep_count = ?,
-			status = case when status = ? then ? else ? end,
 			error = case when status = ? then coalesce(nullif(error, ''), ?) else ? end,
+			status = case when status = ? then ? else ? end,
 			settings_json = ?, updated_at_ms = ?
 			where id = ? and status in (?, ?) and exists (
 			select 1 from codex_inspection_leases where id = 1 and run_id = ? and owner_id = ? and lease_expires_at_ms > ?
@@ -786,8 +894,8 @@ func finalizeRunTx(ctx context.Context, tx *sql.Tx, run model.CodexInspectionRun
 		nullPositiveInt64(run.FinishedAtMS), run.TotalFiles, run.ProbeSetCount,
 		run.SampledCount, run.DisabledCount, run.EnabledCount, run.DeleteCount, run.DisableCount, run.EnableCount,
 		run.ReauthCount, run.KeepCount,
-		model.CodexInspectionStatusCancelling, model.CodexInspectionStatusCancelled, run.Status,
 		model.CodexInspectionStatusCancelling, userCancelledFallbackReason, nullString(run.Error),
+		model.CodexInspectionStatusCancelling, model.CodexInspectionStatusCancelled, run.Status,
 		run.SettingsJSON, run.UpdatedAtMS, run.ID,
 		model.CodexInspectionStatusRunning, model.CodexInspectionStatusCancelling, run.ID, ownerID, now)
 	if err != nil {
@@ -866,7 +974,12 @@ func insertLogTx(ctx context.Context, tx *sql.Tx, entry model.CodexInspectionLog
 			entry.DetailJSON = string(data)
 		}
 	}
-	if err := tx.QueryRowContext(ctx, `insert into codex_inspection_logs(run_id, level, message, detail_json, created_at_ms) values (?, ?, ?, ?, ?) returning id`, entry.RunID, entry.Level, entry.Message, nullString(entry.DetailJSON), entry.CreatedAtMS).Scan(&entry.ID); err != nil {
+	res, err := tx.ExecContext(ctx, `insert into codex_inspection_logs(run_id, level, message, detail_json, created_at_ms) values (?, ?, ?, ?, ?)`, entry.RunID, entry.Level, entry.Message, nullString(entry.DetailJSON), entry.CreatedAtMS)
+	if err != nil {
+		return model.CodexInspectionLog{}, err
+	}
+	entry.ID, err = res.LastInsertId()
+	if err != nil {
 		return model.CodexInspectionLog{}, err
 	}
 	return entry, nil

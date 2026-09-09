@@ -60,6 +60,25 @@ const USAGE_SERVICE_ERROR_CODES = new Set([
   'usage_import_session_quota_exceeded',
   'usage_import_session_limit_exceeded',
   'usage_import_session_unavailable',
+  'sqlite_adoption_unavailable',
+  'sqlite_source_path_required',
+  'sqlite_source_env_managed',
+  'sqlite_source_same_as_current',
+  'sqlite_source_locked',
+  'sqlite_source_invalid',
+  'sqlite_source_not_writable',
+  'sqlite_source_data_key_invalid',
+  'sqlite_source_data_key_env_conflict',
+  'sqlite_source_admin_key_invalid',
+  'sqlite_source_parameters_required',
+  'sqlite_source_confirmation_required',
+  'sqlite_source_selection_conflict',
+  'sqlite_source_topology_unsafe',
+  'sqlite_source_adoption_failed',
+  'database_generation_conflict',
+  'database_management_unavailable',
+  'system_restart_unavailable',
+  'system_restart_already_requested',
 ]);
 
 export interface UsageServiceApiError extends Error {
@@ -116,6 +135,190 @@ export interface UsageServiceDatabaseStatus {
   checkpoint?: UsageServiceCheckpointStatus;
 }
 
+export type DatabaseBackendKind = 'sqlite' | 'mysql' | string;
+
+export interface UsageServiceDatabaseTopology {
+  generation?: number;
+  writePrimary?: DatabaseBackendKind;
+  businessReadPrimary?: DatabaseBackendKind;
+  systemReadPrimary?: DatabaseBackendKind;
+  fallbackSource?: DatabaseBackendKind;
+  fallbackActive?: boolean;
+  readOnly?: boolean;
+  failoverState?: string;
+  readCutoverReady?: boolean;
+  writeFailoverReady?: boolean;
+}
+
+export interface UsageServiceSQLiteStatus extends UsageServiceDatabaseStatus {
+  connected?: boolean;
+  available?: boolean;
+  effectiveBytes?: number;
+  reusableBytes?: number;
+  pageCount?: number;
+  freePageCount?: number;
+  retentionDays?: number;
+  cleanupStatus?: string;
+  rebuildStatus?: string;
+  lastCleanupAtMs?: number;
+  lastRebuildAtMs?: number;
+  lastError?: string;
+}
+
+export interface UsageServiceMetricValue {
+  value?: number;
+  available?: boolean;
+  permissionDenied?: boolean;
+  error?: string;
+}
+
+export interface UsageServiceMySQLPoolStatus {
+  open?: number;
+  inUse?: number;
+  idle?: number;
+  waitCount?: number;
+  waitDurationMs?: number;
+  maxOpen?: number;
+}
+
+export interface UsageServiceMySQLStatus {
+  configured?: boolean;
+  connected?: boolean;
+  available?: boolean;
+  maskedAddress?: string;
+  database?: string;
+  version?: string;
+  pingLatencyMs?: number;
+  uptimeSeconds?: number;
+  databaseBytes?: number;
+  tableBytes?: number;
+  indexBytes?: number;
+  pool?: UsageServiceMySQLPoolStatus;
+  connections?: UsageServiceMetricValue;
+  maxConnections?: UsageServiceMetricValue;
+  queriesPerSecond?: UsageServiceMetricValue;
+  transactionsPerSecond?: UsageServiceMetricValue;
+  slowQueries?: UsageServiceMetricValue;
+  bufferPoolBytes?: UsageServiceMetricValue;
+  lockWaits?: UsageServiceMetricValue;
+  deadlocks?: UsageServiceMetricValue;
+  dataLockWaits?: UsageServiceMetricValue;
+  metadataLockWaits?: UsageServiceMetricValue;
+  lastError?: string;
+}
+
+export interface UsageServiceReplicationStatus {
+  enabled?: boolean;
+  direction?: string;
+  epoch?: number;
+  sourceWatermark?: number;
+  targetWatermark?: number;
+  pendingRows?: number;
+  pendingMutations?: number;
+  pendingBytes?: number;
+  oldestPendingAtMs?: number;
+  throughputRowsPerSecond?: number;
+  mutationsPerSecond?: number;
+  retries?: number;
+  retryCount?: number;
+  lastProgressAtMs?: number;
+  lastSuccessAtMs?: number;
+  heartbeatAtMs?: number;
+  state?: 'idle' | 'running' | 'warning' | 'stalled' | 'error' | string;
+  stalled?: boolean;
+  error?: string;
+  lastError?: string;
+}
+
+export interface UsageServiceMigrationTableProgress {
+  table?: string;
+  name?: string;
+  stage?: 'history' | 'derived' | string;
+  copiedRows?: number;
+  totalRows?: number;
+  copiedBytes?: number;
+  totalBytes?: number;
+  progress?: number;
+  completed?: boolean;
+  active?: boolean;
+  updatedAtMs?: number;
+  checksum?: string;
+  error?: string;
+}
+
+export interface UsageServiceDatabaseMigrationStatus {
+  id?: string;
+  state?: string;
+  status?: string;
+  phase?: string;
+  progressPercent?: number;
+  completedSteps?: number;
+  totalSteps?: number;
+  currentTable?: string;
+  currentTableActive?: boolean;
+  currentTableSinceMs?: number;
+  copiedRows?: number;
+  totalRows?: number;
+  copiedBytes?: number;
+  totalBytes?: number;
+  requests?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
+  reasoningTokens?: number;
+  cost?: number;
+  rowsPerSecond?: number;
+  etaSeconds?: number;
+  startedAtMs?: number;
+  updatedAtMs?: number;
+  validationToken?: string;
+  validationValid?: boolean;
+  validationProgress?: UsageServiceMigrationValidationProgress;
+  validationError?: string;
+  lastError?: string;
+  error?: string;
+  source?: DatabaseBackendKind;
+  target?: DatabaseBackendKind;
+  finishedAtMs?: number;
+  priceManifestSha256?: string;
+  tables?: UsageServiceMigrationTableProgress[];
+  derivedTables?: UsageServiceMigrationTableProgress[];
+}
+
+export interface UsageServiceMigrationValidationProgress {
+  running?: boolean;
+  stage?: string;
+  currentTable?: string;
+  currentTableSinceMs?: number;
+  side?: string;
+  completedSteps?: number;
+  totalSteps?: number;
+  processedRows?: number;
+  totalRows?: number;
+  progressPercent?: number;
+  startedAtMs?: number;
+  updatedAtMs?: number;
+}
+
+export interface UsageServiceCacheCoverage {
+  complete?: boolean;
+  fromMs?: number;
+  toMs?: number;
+  fromId?: number;
+  toId?: number;
+  watermark?: number;
+  minimumEventId?: number;
+  maximumEventId?: number;
+  syncedWatermark?: number;
+  retentionDays?: number;
+  cleanupEnabled?: boolean;
+  cleanupState?: string;
+  lastCleanupAtMs?: number;
+  lastValidatedAtMs?: number;
+  cleanupPaused?: boolean;
+  pauseReason?: string;
+}
+
 export type UsageServiceDatabaseMaintenanceReason =
   | 'deferred_indexes'
   | 'offline_derived_cleanup'
@@ -134,12 +337,133 @@ export interface UsageServiceDatabaseMaintenanceStatus {
 
 export interface UsageServiceStatus {
   service?: string;
+  recoveryMode?: boolean;
   dbPath?: string;
   events?: number;
   deadLetters?: number;
   collector?: UsageServiceCollectorStatus;
   database?: UsageServiceDatabaseStatus;
   databaseMaintenance?: UsageServiceDatabaseMaintenanceStatus;
+  databaseTopology?: UsageServiceDatabaseTopology;
+  databases?: {
+    sqlite?: UsageServiceSQLiteStatus;
+    mysql?: UsageServiceMySQLStatus;
+  };
+  replication?: UsageServiceReplicationStatus;
+  databaseMigration?: UsageServiceDatabaseMigrationStatus;
+  cacheCoverage?: UsageServiceCacheCoverage;
+  sqliteSource?: SQLiteSourceStatus;
+}
+
+export interface DatabaseMutationControl {
+  expectedGeneration: number;
+  idempotencyKey: string;
+}
+
+export interface DatabaseDangerousOperationConfirmation {
+  target: DatabaseBackendKind;
+  migrationId: string;
+  validationToken: string;
+}
+
+export interface MySQLConnectionInput {
+  address: string;
+  database: string;
+  username: string;
+  password?: string;
+  tlsMode: 'verify_identity' | 'disabled';
+  caCertificate?: string;
+  confirmInsecureTls?: boolean;
+}
+
+export interface MySQLConnectionTestResult {
+  success: boolean;
+  version?: string;
+  latencyMs?: number;
+  warnings?: string[];
+  error?: string;
+}
+
+export interface MySQLSchemaReinitializeInput extends DatabaseMutationControl {
+  target: 'mysql';
+  confirmDatabase: string;
+  confirmDrop: true;
+}
+
+export interface DatabaseManagementStatus {
+  generation?: number;
+  databaseTopology?: UsageServiceDatabaseTopology;
+  databases?: UsageServiceStatus['databases'];
+  replication?: UsageServiceReplicationStatus;
+  databaseMigration?: UsageServiceDatabaseMigrationStatus;
+  cacheCoverage?: UsageServiceCacheCoverage;
+}
+
+export interface DatabaseMigrationHistoryEvent {
+  id: number;
+  migrationId: string;
+  eventType: string;
+  previousPhase?: string;
+  previousStatus?: string;
+  phase: string;
+  status: string;
+  generation: number;
+  table?: string;
+  error?: string;
+  createdAtMs: number;
+}
+
+export interface DatabaseMigrationHistoryTable {
+  name: string;
+  stage: string;
+  rowsCopied: number;
+  totalRows?: number;
+  copiedBytes: number;
+  requests: number;
+  completed: boolean;
+  updatedAtMs: number;
+}
+
+export interface DatabaseMigrationHistoryRecord {
+  id: string;
+  source: DatabaseBackendKind;
+  target: DatabaseBackendKind;
+  phase: string;
+  status: string;
+  generation: number;
+  batchSize: number;
+  progressPercent: number;
+  copiedRows: number;
+  totalRows: number;
+  copiedBytes: number;
+  requests: number;
+  completedTables: number;
+  totalTables: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+  finishedAtMs?: number;
+  lastError?: string;
+  tables: DatabaseMigrationHistoryTable[];
+  events: DatabaseMigrationHistoryEvent[];
+}
+
+export interface DatabaseMigrationHistoryResponse {
+  activeMigrationId?: string;
+  migrations: DatabaseMigrationHistoryRecord[];
+}
+
+export interface SQLiteCachePolicyInput extends DatabaseMutationControl {
+  enabled: boolean;
+  retentionDays: number;
+}
+
+export interface SQLiteCacheCleanupPreview {
+  eligible?: boolean;
+  estimatedRows?: number;
+  estimatedBytes?: number;
+  coverageFromMs?: number;
+  coverageToMs?: number;
+  blockedReason?: string;
 }
 
 export type UsageServiceStatusScope = 'database-maintenance';
@@ -201,6 +525,69 @@ export interface UsageServiceSetupRequest {
   requestMonitoringEnabled?: boolean;
 }
 
+export interface SQLiteAdoptionRequest {
+  sourcePath: string;
+  dataKeyPath?: string;
+  sourceAdminKey?: string;
+  confirmSourceStopped?: boolean;
+}
+
+export interface SQLiteAdoptionPreflightResult {
+  ready: boolean;
+  sourcePath: string;
+  dataKeyPath?: string;
+  databaseBytes: number;
+  walBytes?: number;
+  shmBytes?: number;
+  hasHistoricalData: boolean;
+  hasEncryptedConnection: boolean;
+  dataKeyRequired: boolean;
+  dataKeyVerified: boolean;
+  adminKeyRequired: boolean;
+  adminKeyVerified: boolean;
+  adminKeyWillBeCreated: boolean;
+  adminKeyWillBeRetained: boolean;
+  projectInitialized: boolean;
+  requiredParameters: string[];
+  lockRisk: boolean;
+  restartRequired: boolean;
+}
+
+export interface SQLiteAdoptionResult {
+  ok: boolean;
+  sourcePath: string;
+  dataKeyPath?: string;
+  restartRequired: boolean;
+  selectionState: string;
+  adminKeyRetained?: boolean;
+}
+
+export interface SQLiteSourceSwitchRequest extends SQLiteAdoptionRequest, DatabaseMutationControl {}
+
+export interface SQLiteSourceStatus {
+  currentPath: string;
+  currentDataKeyPath?: string;
+  selectionState?: string;
+  selectionOperation?: string;
+  pendingPath?: string;
+  pendingDataKeyPath?: string;
+  selectedAtMs?: number;
+  activatedAtMs?: number;
+  restartRequired: boolean;
+  failedPath?: string;
+  failedDataKeyPath?: string;
+  lastErrorStage?: string;
+  lastErrorCause?: string;
+  lastError?: string;
+  failedAtMs?: number;
+}
+
+export interface ManagerRestartResult {
+  ok: boolean;
+  restarting: boolean;
+  startedAt: number;
+}
+
 export interface ManagerCPAConnectionConfig {
   cpaBaseUrl: string;
   managementKeyConfigured?: boolean;
@@ -222,6 +609,12 @@ export interface ManagerCollectorConfig {
 export interface ManagerExternalUsageServiceConfig {
   enabled: boolean;
   serviceBase: string;
+}
+
+export interface ManagerCustomPageConfig {
+  id: string;
+  title: string;
+  url: string;
 }
 
 export type ManagerCodexInspectionScheduleMode = 'interval' | 'time_points';
@@ -259,6 +652,7 @@ export interface ManagerConfig {
   collector: ManagerCollectorConfig;
   codexInspection?: ManagerCodexInspectionConfig;
   externalUsageService: ManagerExternalUsageServiceConfig;
+  customPages?: ManagerCustomPageConfig[];
   updatedAtMs?: number;
 }
 
@@ -1912,6 +2306,11 @@ export interface MonitoringAnalyticsResponse {
 }
 
 const USAGE_SERVICE_TIMEOUT_MS = 30 * 1000;
+// Final validation scans and hashes every authoritative row in both stores.
+// Multi-gigabyte installations legitimately take much longer than an ordinary
+// management request, so the browser must not abort the server-side write
+// fence after the generic 30-second timeout.
+const DATABASE_MIGRATION_VALIDATION_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 const USAGE_SERVICE_TRANSFER_TIMEOUT_MS = 60 * 1000;
 const USAGE_IMPORT_CHUNK_TIMEOUT_MS = 5 * 60 * 1000;
 const CODEX_INSPECTION_RUN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -2634,6 +3033,117 @@ export const usageServiceApi = {
     });
   },
 
+  preflightSQLiteSource: async (
+    base: string,
+    payload: SQLiteAdoptionRequest,
+    adminKey?: string
+  ): Promise<SQLiteAdoptionPreflightResult> => {
+    return withUsageServiceError(async () => {
+      const response = await axios.post<SQLiteAdoptionPreflightResult>(
+        buildUrl(base, '/setup/sqlite-source/preflight'),
+        payload,
+        {
+          timeout: 60_000,
+          headers: authHeaders(adminKey),
+        }
+      );
+      return response.data;
+    });
+  },
+
+  adoptSQLiteSource: async (
+    base: string,
+    payload: SQLiteAdoptionRequest,
+    adminKey?: string
+  ): Promise<SQLiteAdoptionResult> => {
+    return withUsageServiceError(async () => {
+      const response = await axios.post<SQLiteAdoptionResult>(
+        buildUrl(base, '/setup/sqlite-source/adopt'),
+        payload,
+        {
+          timeout: 60_000,
+          headers: authHeaders(adminKey),
+        }
+      );
+      return response.data;
+    });
+  },
+
+  preflightSQLiteSourceSwitch: async (
+    base: string,
+    managementKey: string,
+    payload: SQLiteSourceSwitchRequest
+  ): Promise<SQLiteAdoptionPreflightResult> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      return {
+        ready: true,
+        sourcePath: payload.sourcePath,
+        databaseBytes: 0,
+        hasHistoricalData: true,
+        hasEncryptedConnection: false,
+        dataKeyRequired: false,
+        dataKeyVerified: false,
+        adminKeyRequired: false,
+        adminKeyVerified: false,
+        adminKeyWillBeCreated: false,
+        adminKeyWillBeRetained: true,
+        projectInitialized: true,
+        requiredParameters: [],
+        lockRisk: true,
+        restartRequired: true,
+      };
+    }
+    return withUsageServiceError(async () => {
+      const response = await axios.post<SQLiteAdoptionPreflightResult>(
+        buildUrl(base, '/v0/management/databases/sqlite-source/preflight'),
+        payload,
+        { timeout: 60_000, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  switchSQLiteSource: async (
+    base: string,
+    managementKey: string,
+    payload: SQLiteSourceSwitchRequest
+  ): Promise<SQLiteAdoptionResult> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      return {
+        ok: true,
+        sourcePath: payload.sourcePath,
+        dataKeyPath: payload.dataKeyPath,
+        restartRequired: true,
+        selectionState: 'pending',
+      };
+    }
+    return withUsageServiceError(async () => {
+      const response = await axios.post<SQLiteAdoptionResult>(
+        buildUrl(base, '/v0/management/databases/sqlite-source/switch'),
+        payload,
+        { timeout: 60_000, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  restartManagerServer: async (
+    base: string,
+    managementKey: string
+  ): Promise<ManagerRestartResult> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      return { ok: true, restarting: true, startedAt: Date.now() - 1 };
+    }
+    return withUsageServiceError(async () => {
+      const response = await axios.post<ManagerRestartResult>(
+        buildUrl(base, '/v0/management/system/restart'),
+        {},
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
   getManagerConfig: async (
     base: string,
     managementKey?: string
@@ -2845,6 +3355,261 @@ export const usageServiceApi = {
         timeout: USAGE_SERVICE_TIMEOUT_MS,
         headers: authHeaders(managementKey),
       });
+      return response.data;
+    });
+  },
+
+  testMySQLConnection: async (
+    base: string,
+    managementKey: string,
+    connection: MySQLConnectionInput
+  ): Promise<MySQLConnectionTestResult> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      return { success: true, version: 'MySQL 8.4.3', latencyMs: 6 };
+    }
+    return withUsageServiceError(async () => {
+      const response = await axios.post<MySQLConnectionTestResult>(
+        buildUrl(base, '/v0/management/databases/mysql/test'),
+        connection,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  saveMySQLConfig: async (
+    base: string,
+    managementKey: string,
+    input: MySQLConnectionInput & DatabaseMutationControl
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.put<DatabaseManagementStatus>(
+        buildUrl(base, '/v0/management/databases/mysql/config'),
+        input,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  reinitializeMySQLSchema: async (
+    base: string,
+    managementKey: string,
+    input: MySQLSchemaReinitializeInput
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.post<DatabaseManagementStatus>(
+        buildUrl(base, '/v0/management/databases/mysql/schema/reinitialize'),
+        input,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  enableDatabaseReplication: async (
+    base: string,
+    managementKey: string,
+    control: DatabaseMutationControl
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.post<DatabaseManagementStatus>(
+        buildUrl(base, '/v0/management/databases/replication/enable'),
+        control,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  startDatabaseMigration: async (
+    base: string,
+    managementKey: string,
+    control: DatabaseMutationControl
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.post<DatabaseManagementStatus>(
+        buildUrl(base, '/v0/management/databases/migrations'),
+        control,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  getDatabaseMigrationHistory: async (
+    base: string,
+    managementKey: string,
+    limit = 20
+  ): Promise<DatabaseMigrationHistoryResponse> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      const demo = getDemoUsageServiceStatus();
+      const migration = demo.databaseMigration;
+      return {
+        activeMigrationId: migration?.id,
+        migrations: migration?.id
+          ? [
+              {
+                id: migration.id,
+                source: migration.source ?? 'sqlite',
+                target: migration.target ?? 'mysql',
+                phase: migration.phase ?? '',
+                status: migration.status ?? migration.state ?? '',
+                generation: 1,
+                batchSize: 1000,
+                progressPercent: migration.progressPercent ?? 0,
+                copiedRows: migration.copiedRows ?? 0,
+                totalRows: migration.totalRows ?? 0,
+                copiedBytes: migration.copiedBytes ?? 0,
+                requests: migration.requests ?? 0,
+                completedTables: migration.completedSteps ?? 0,
+                totalTables: migration.totalSteps ?? 0,
+                createdAtMs: migration.startedAtMs ?? Date.now(),
+                updatedAtMs: migration.updatedAtMs ?? Date.now(),
+                finishedAtMs: migration.finishedAtMs,
+                lastError: migration.lastError ?? migration.error,
+                tables: [],
+                events: [],
+              },
+            ]
+          : [],
+      };
+    }
+    return withUsageServiceError(async () => {
+      const response = await axios.get<DatabaseMigrationHistoryResponse>(
+        buildUrl(base, `/v0/management/databases/migrations?limit=${encodeURIComponent(limit)}`),
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  updateDatabaseMigration: async (
+    base: string,
+    managementKey: string,
+    migrationId: string,
+    action: 'pause' | 'resume' | 'cancel' | 'validate',
+    control: DatabaseMutationControl
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.post<DatabaseManagementStatus>(
+        buildUrl(
+          base,
+          `/v0/management/databases/migrations/${encodeURIComponent(migrationId)}/${action}`
+        ),
+        control,
+        {
+          timeout:
+            action === 'validate'
+              ? DATABASE_MIGRATION_VALIDATION_TIMEOUT_MS
+              : USAGE_SERVICE_TIMEOUT_MS,
+          headers: authHeaders(managementKey),
+        }
+      );
+      return response.data;
+    });
+  },
+
+  cutoverDatabaseReads: async (
+    base: string,
+    managementKey: string,
+    input: DatabaseMutationControl & DatabaseDangerousOperationConfirmation
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.post<DatabaseManagementStatus>(
+        buildUrl(base, '/v0/management/databases/routing/cutover'),
+        input,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  failoverDatabaseWrites: async (
+    base: string,
+    managementKey: string,
+    input: DatabaseMutationControl & DatabaseDangerousOperationConfirmation
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.post<DatabaseManagementStatus>(
+        buildUrl(base, '/v0/management/databases/routing/failover'),
+        input,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  updateSQLiteCachePolicy: async (
+    base: string,
+    managementKey: string,
+    input: SQLiteCachePolicyInput
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.put<DatabaseManagementStatus>(
+        buildUrl(base, '/v0/management/databases/sqlite-cache/policy'),
+        input,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  previewSQLiteCacheCleanup: async (
+    base: string,
+    managementKey: string,
+    control: DatabaseMutationControl
+  ): Promise<SQLiteCacheCleanupPreview> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      return { eligible: true, estimatedRows: 142_300, estimatedBytes: 1_610_612_736 };
+    }
+    return withUsageServiceError(async () => {
+      const response = await axios.post<SQLiteCacheCleanupPreview>(
+        buildUrl(base, '/v0/management/databases/sqlite-cache/cleanup/preview'),
+        control,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  cleanupSQLiteCache: async (
+    base: string,
+    managementKey: string,
+    input: DatabaseMutationControl & DatabaseDangerousOperationConfirmation
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.post<DatabaseManagementStatus>(
+        buildUrl(base, '/v0/management/databases/sqlite-cache/cleanup'),
+        input,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
+      return response.data;
+    });
+  },
+
+  rebuildSQLiteCache: async (
+    base: string,
+    managementKey: string,
+    input: DatabaseMutationControl &
+      DatabaseDangerousOperationConfirmation & { retentionDays: number }
+  ): Promise<DatabaseManagementStatus> => {
+    if (__DEMO_SITE__ && isDemoMode()) return getDemoUsageServiceStatus();
+    return withUsageServiceError(async () => {
+      const response = await axios.post<DatabaseManagementStatus>(
+        buildUrl(base, '/v0/management/databases/sqlite-cache/rebuild'),
+        input,
+        { timeout: USAGE_SERVICE_TIMEOUT_MS, headers: authHeaders(managementKey) }
+      );
       return response.data;
     });
   },

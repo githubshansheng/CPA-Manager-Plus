@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
@@ -18,10 +19,11 @@ func (r *repository) LoadEventsCount(ctx context.Context, filter AnalyticsFilter
 	if !SupportsEventProjectionFilter(filter) {
 		return 0, State{}, false, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return 0, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	state, available, projectionComplete, err := projectionReadState(ctx, tx)
 	if err != nil || !available {
@@ -58,10 +60,11 @@ func (r *repository) LoadEventsPage(
 	if limit <= 0 {
 		return EventsPage{}, State{}, true, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return EventsPage{}, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	state, available, projectionComplete, err := projectionReadState(ctx, tx)
 	if err != nil || !available {
@@ -132,7 +135,7 @@ func (r *repository) LoadEventsPage(
 	}, state, true, nil
 }
 
-func loadEventPageItemsByCandidates(ctx context.Context, tx *sql.Tx, candidates []eventPageCandidate) ([]EventPageItem, error) {
+func loadEventPageItemsByCandidates(ctx context.Context, tx *dialect.Tx, candidates []eventPageCandidate) ([]EventPageItem, error) {
 	if len(candidates) == 0 {
 		return []EventPageItem{}, nil
 	}

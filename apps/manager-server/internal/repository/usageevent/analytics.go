@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	sqldialect "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageprojection"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
@@ -489,8 +490,8 @@ type HeaderSnapshot struct {
 }
 
 func (r *repository) AggregateWithFilter(ctx context.Context, filter AnalyticsFilter) (Aggregate, error) {
-	where, args := analyticsWhere(filter)
-	row := r.db.QueryRowContext(ctx, `select
+	where, args := analyticsWhere(filter, r.isMySQL())
+	row := r.queryRowContext(ctx, `select
 	count(*) as calls,
 	sum(case when failed = 0 then 1 else 0 end),
 	sum(case when failed = 1 then 1 else 0 end),
@@ -529,7 +530,7 @@ from usage_events `+where, args...)
 }
 
 func (r *repository) ModelStatsWithFilter(ctx context.Context, filter AnalyticsFilter, limit int) ([]ModelStat, error) {
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	query := pricingBandedUsageEventsCTE + `
 select
 	analytics_model_value as model,
@@ -591,7 +592,7 @@ group by f.analytics_model_value, billing_model, f.pricing_model_value, f.contex
 order by max(t.model_calls) desc, f.analytics_model_value, calls desc`
 		args = append(args, limit)
 	}
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	rows, err := r.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -629,7 +630,7 @@ order by max(t.model_calls) desc, f.analytics_model_value, calls desc`
 }
 
 func (r *repository) TimelineWithFilter(ctx context.Context, filter AnalyticsFilter, granularity string, location *time.Location) ([]TimelinePoint, error) {
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	query := fmt.Sprintf(pricingBandedUsageEventsCTE+`
 select
 	timestamp_ms,
@@ -649,7 +650,7 @@ select
 	latency_ms
 from banded_usage_events %s
 order by timestamp_ms, analytics_model_value`, where)
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	rows, err := r.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -761,7 +762,7 @@ func (r *repository) APIKeyTimelineWithFilter(ctx context.Context, filter Analyt
 	if len(normalizeFilterValues(filter.APIKeyHashes)) == 0 && strings.TrimSpace(filter.SearchAPIKeyHash) == "" {
 		return nil, nil
 	}
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	query := fmt.Sprintf(pricingBandedUsageEventsCTE+`
 select
 	timestamp_ms,
@@ -782,7 +783,7 @@ select
 	latency_ms
 from banded_usage_events %s
 order by timestamp_ms, api_key_hash, analytics_model_value`, where)
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	rows, err := r.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -882,7 +883,7 @@ order by timestamp_ms, api_key_hash, analytics_model_value`, where)
 }
 
 func (r *repository) LatencyPercentilesWithFilter(ctx context.Context, filter AnalyticsFilter, granularity string, location *time.Location) ([]LatencyPercentiles, error) {
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	query := fmt.Sprintf(`select
 	timestamp_ms,
 	coalesce(latency_ms, 0),
@@ -890,7 +891,7 @@ func (r *repository) LatencyPercentilesWithFilter(ctx context.Context, filter An
 from usage_events %s
 and (latency_ms > 0 or ttft_ms > 0)
 order by timestamp_ms`, where)
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	rows, err := r.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -944,7 +945,7 @@ order by timestamp_ms`, where)
 }
 
 func (r *repository) LatencySummaryWithFilter(ctx context.Context, filter AnalyticsFilter) (LatencySummary, error) {
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	query := fmt.Sprintf(`with samples(kind, value) as (
 	select 'latency', latency_ms from usage_events %s and latency_ms > 0
 	union all
@@ -963,7 +964,7 @@ where sample_number = ((sample_count * 95) + 99) / 100`, where, where)
 	queryArgs := make([]any, 0, len(args)*2)
 	queryArgs = append(queryArgs, args...)
 	queryArgs = append(queryArgs, args...)
-	rows, err := r.db.QueryContext(ctx, query, queryArgs...)
+	rows, err := r.queryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return LatencySummary{}, err
 	}
@@ -1008,8 +1009,8 @@ func (r *repository) HourlyDistributionWithFilter(ctx context.Context, filter An
 	if location == nil {
 		location = time.UTC
 	}
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, `select timestamp_ms, total_tokens
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, `select timestamp_ms, total_tokens
 from usage_events `+where+`
 order by timestamp_ms`, args...)
 	if err != nil {
@@ -1152,8 +1153,8 @@ func (r *repository) FilterSelectorValuesWithFilter(ctx context.Context, filter 
 }
 
 func (r *repository) apiKeyFilterSelectorValuesWithFilter(ctx context.Context, filter AnalyticsFilter) ([]APIKeySelectorValue, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, `select
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, `select
 	coalesce(api_key_hash, ''),
 	coalesce(nullif(auth_provider_snapshot, ''), nullif(provider, ''), ''),
 	coalesce(auth_index, ''),
@@ -1192,8 +1193,8 @@ order by 1, 5, 3, 4, 2`, args...)
 }
 
 func (r *repository) accountFilterSelectorValuesWithFilter(ctx context.Context, filter AnalyticsFilter) ([]AccountSelectorValue, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, `select
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, `select
 	coalesce(account_snapshot, ''),
 	coalesce(auth_label_snapshot, ''),
 	coalesce(nullif(auth_provider_snapshot, ''), nullif(provider, ''), ''),
@@ -1242,8 +1243,8 @@ order by 1, 2, 5, 4, 6`, args...)
 }
 
 func (r *repository) distinctFilterValues(ctx context.Context, filter AnalyticsFilter, expression string) ([]string, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, `select distinct `+expression+` as value
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, `select distinct `+expression+` as value
 from usage_events `+where+`
 and `+expression+` <> ''
 order by value`, args...)
@@ -1264,8 +1265,8 @@ order by value`, args...)
 }
 
 func (r *repository) HeatmapWithFilter(ctx context.Context, filter AnalyticsFilter, location *time.Location) ([]HeatmapPoint, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, pricingBandedUsageEventsCTE+`
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, pricingBandedUsageEventsCTE+`
 select
 	timestamp_ms,
 	analytics_model_value as model,
@@ -1395,39 +1396,8 @@ order by timestamp_ms, model`, args...)
 }
 
 func (r *repository) ChannelModelStatsWithFilter(ctx context.Context, filter AnalyticsFilter) ([]ChannelModelStat, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, pricingBandedUsageEventsCTE+`
-select
-	coalesce(auth_index, ''),
-	coalesce(max(source), ''),
-	coalesce(max(account_snapshot), ''),
-	coalesce(max(auth_label_snapshot), ''),
-	coalesce(nullif(max(auth_provider_snapshot), ''), max(provider), ''),
-	coalesce(max(auth_account_id_snapshot), ''),
-	analytics_model_value as model,
-	billing_model_value as billing_model,
-	pricing_model_value,
-	context_threshold_tokens_value,
-	coalesce(service_tier, '') as service_tier,
-	count(*),
-	sum(case when failed = 0 then 1 else 0 end),
-	sum(case when failed = 1 then 1 else 0 end),
-		coalesce(sum(`+normalizedInputExpr+`), 0),
-	coalesce(sum(output_tokens), 0),
-	coalesce(sum(`+compatCachedExpr+`), 0),
-	coalesce(sum(cache_read_tokens), 0),
-	coalesce(sum(cache_creation_tokens), 0),
-	coalesce(sum(`+longInputExpr+`), 0),
-	coalesce(sum(`+longOutputExpr+`), 0),
-	coalesce(sum(`+longCachedExpr+`), 0),
-	coalesce(sum(`+longCacheReadExpr+`), 0),
-	coalesce(sum(`+longCacheCreationExpr+`), 0),
-	coalesce(sum(total_tokens), 0),
-	avg(nullif(latency_ms, 0)),
-	count(nullif(latency_ms, 0))
-from banded_usage_events `+where+`
-group by auth_index, analytics_model_value, billing_model, pricing_model_value, context_threshold_tokens_value, coalesce(service_tier, '')
-order by count(*) desc`, args...)
+	query, args := channelModelStatsQuery(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1472,9 +1442,47 @@ order by count(*) desc`, args...)
 	return stats, rows.Err()
 }
 
+func channelModelStatsQuery(filter AnalyticsFilter, mysql bool) (string, []any) {
+	where, args := analyticsWhere(filter, mysql)
+	baseFilter := strings.TrimPrefix(where, "where ")
+	query := pricingBandedUsageEventsCTEWithBaseFilter(baseFilter) + `
+select
+	coalesce(auth_index, ''),
+	coalesce(max(source), ''),
+	coalesce(max(account_snapshot), ''),
+	coalesce(max(auth_label_snapshot), ''),
+	coalesce(nullif(max(auth_provider_snapshot), ''), max(provider), ''),
+	coalesce(max(auth_account_id_snapshot), ''),
+	analytics_model_value as model,
+	billing_model_value as billing_model,
+	pricing_model_value,
+	context_threshold_tokens_value,
+	coalesce(service_tier, '') as service_tier,
+	count(*),
+	sum(case when failed = 0 then 1 else 0 end),
+	sum(case when failed = 1 then 1 else 0 end),
+		coalesce(sum(` + normalizedInputExpr + `), 0),
+	coalesce(sum(output_tokens), 0),
+	coalesce(sum(` + compatCachedExpr + `), 0),
+	coalesce(sum(cache_read_tokens), 0),
+	coalesce(sum(cache_creation_tokens), 0),
+	coalesce(sum(` + longInputExpr + `), 0),
+	coalesce(sum(` + longOutputExpr + `), 0),
+	coalesce(sum(` + longCachedExpr + `), 0),
+	coalesce(sum(` + longCacheReadExpr + `), 0),
+	coalesce(sum(` + longCacheCreationExpr + `), 0),
+	coalesce(sum(total_tokens), 0),
+	avg(nullif(latency_ms, 0)),
+	count(nullif(latency_ms, 0))
+from banded_usage_events
+group by auth_index, analytics_model_value, billing_model, pricing_model_value, context_threshold_tokens_value, coalesce(service_tier, '')
+order by count(*) desc`
+	return query, args
+}
+
 func (r *repository) FailureSourcesWithFilter(ctx context.Context, filter AnalyticsFilter) ([]FailureSourceStat, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, `select
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, `select
 	coalesce(max(source), ''),
 	coalesce(source_hash, ''),
 	coalesce(auth_index, ''),
@@ -1517,8 +1525,8 @@ order by sum(case when failed = 1 then 1 else 0 end) desc, max(timestamp_ms) des
 }
 
 func (r *repository) AccountModelStatsWithFilter(ctx context.Context, filter AnalyticsFilter) ([]AccountModelStat, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, pricingBandedUsageEventsCTE+`
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, pricingBandedUsageEventsCTE+`
 select
 	coalesce(account_snapshot, ''),
 	coalesce(auth_label_snapshot, ''),
@@ -1608,21 +1616,20 @@ func (r *repository) AccountWindowModelStats(ctx context.Context, windows []Acco
 	if len(windows) == 0 {
 		return []AccountWindowModelStat{}, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
+	tx := sqldialect.WrapTx(rawTx, sqldialect.ForBackend(r.backend))
 	defer func() { _ = tx.Rollback() }()
 	resolvedWindows, err := ResolveAccountWindowLegacyKeys(ctx, tx, windows)
 	if err != nil {
 		return nil, err
 	}
 
-	values := make([]string, 0, len(resolvedWindows))
 	args := make([]any, 0, len(resolvedWindows)*5)
 	for _, window := range resolvedWindows {
 		accountKey, legacyAccountKey := accountWindowQueryKeys(window)
-		values = append(values, "(?, ?, ?, ?, ?)")
 		args = append(
 			args,
 			window.RequestIndex,
@@ -1636,7 +1643,7 @@ func (r *repository) AccountWindowModelStats(ctx context.Context, windows []Acco
 	rows, err := tx.QueryContext(ctx, pricingBandedUsageEventsCTE+`, window_targets(
 	request_index, from_ms, to_ms, account_key, legacy_account_key
 ) as (
-	values `+strings.Join(values, ",")+`
+	`+r.valuesCTE(5, len(resolvedWindows))+`
 )
 select
 	w.request_index,
@@ -1842,8 +1849,8 @@ func accountWindowQueryKeys(window AccountWindowUsageQuery) (string, string) {
 }
 
 func (r *repository) CredentialModelStatsWithFilter(ctx context.Context, filter AnalyticsFilter) ([]CredentialModelStat, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, pricingBandedUsageEventsCTE+`
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, pricingBandedUsageEventsCTE+`
 select
 	`+credentialIDExpr+` as credential_id,
 	coalesce(auth_file_snapshot, ''),
@@ -1970,7 +1977,7 @@ func (r *repository) CredentialTimelineWithFilter(ctx context.Context, filter An
 }
 
 func (r *repository) credentialTimelineRawWithFilter(ctx context.Context, filter AnalyticsFilter, granularity string, location *time.Location) ([]CredentialTimelinePoint, error) {
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	query := fmt.Sprintf(pricingBandedUsageEventsCTE+`
 select
 	timestamp_ms,
@@ -2000,7 +2007,7 @@ select
 	latency_ms
 from banded_usage_events %s
 	order by timestamp_ms, credential_id, analytics_model_value`, where)
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	rows, err := r.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2129,7 +2136,7 @@ from banded_usage_events %s
 }
 
 func (r *repository) credentialTimelineHourlyWithFilter(ctx context.Context, filter AnalyticsFilter, granularity string, location *time.Location) ([]CredentialTimelinePoint, error) {
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	const hourBucketExpr = "(timestamp_ms / 3600000) * 3600000"
 	queryPrefix := pricingBandedUsageEventsCTE + "\n"
 	queryFrom := "from banded_usage_events\n"
@@ -2141,12 +2148,15 @@ func (r *repository) credentialTimelineHourlyWithFilter(ctx context.Context, fil
 			bucketSizeMS = int64(24 * time.Hour / time.Millisecond)
 		}
 		bucketExpr = fmt.Sprintf("((timestamp_ms + %d) / %d) * %d - %d", offsetMS, bucketSizeMS, bucketSizeMS, offsetMS)
+		if r.isMySQL() {
+			bucketExpr = fmt.Sprintf("floor((timestamp_ms + %d) / %d) * %d - %d", offsetMS, bucketSizeMS, bucketSizeMS, offsetMS)
+		}
 	} else {
-		mapSQL, mapArgs, ok := credentialBucketMapSQL(filter.FromMS, filter.ToMS, granularity, location)
+		_, mapArgs, ok := credentialBucketMapSQL(filter.FromMS, filter.ToMS, granularity, location)
 		if !ok {
 			return r.credentialTimelineRawWithFilter(ctx, filter, granularity, location)
 		}
-		queryPrefix = pricingBandedUsageEventsCTE + ", bucket_map(hour_bucket, bucket_ms) as (values " + mapSQL + ")\n"
+		queryPrefix = pricingBandedUsageEventsCTE + ", bucket_map(hour_bucket, bucket_ms) as (" + r.valuesCTE(2, len(mapArgs)/2) + ")\n"
 		queryFrom += "join bucket_map on " + hourBucketExpr + " = bucket_map.hour_bucket\n"
 		queryArgs = append(mapArgs, args...)
 	}
@@ -2192,7 +2202,7 @@ group by ` + bucketExpr + `, credential_id,
 	coalesce(auth_account_id_snapshot, ''),
 		analytics_model_value, billing_model, pricing_model_value, context_threshold_tokens_value, service_tier
 	order by min(timestamp_ms), credential_id, analytics_model_value`
-	rows, err := r.db.QueryContext(ctx, query, queryArgs...)
+	rows, err := r.queryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -2371,8 +2381,8 @@ func mergeCredentialTimelineParts(parts [][]CredentialTimelinePoint) []Credentia
 }
 
 func (r *repository) APIKeyModelStatsWithFilter(ctx context.Context, filter AnalyticsFilter) ([]APIKeyModelStat, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, pricingBandedUsageEventsCTE+`
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, pricingBandedUsageEventsCTE+`
 select
 	coalesce(api_key_hash, ''),
 	coalesce(account_snapshot, ''),
@@ -2455,8 +2465,8 @@ order by max(timestamp_ms) desc, count(*) desc`, args...)
 }
 
 func (r *repository) TaskBucketsWithFilter(ctx context.Context, filter AnalyticsFilter) ([]TaskBucket, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, `select
+	where, args := analyticsWhere(filter, r.isMySQL())
+	query := `select
 	coalesce(timestamp, '') || '|' || coalesce(source_hash, '') || '|' || coalesce(auth_index, '') as bucket_key,
 	count(*),
 	sum(case when failed = 0 then 1 else 0 end),
@@ -2466,20 +2476,26 @@ func (r *repository) TaskBucketsWithFilter(ctx context.Context, filter Analytics
 	coalesce(max(source), ''),
 	coalesce(source_hash, ''),
 	coalesce(auth_index, ''),
-		coalesce(group_concat(distinct `+usageidentity.SQLRequestAnalyticsModelExpression("model", "requested_model")+`), ''),
+		coalesce(group_concat(distinct ` + usageidentity.SQLRequestAnalyticsModelExpression("model", "requested_model") + `), ''),
 	coalesce(group_concat(distinct endpoint), ''),
-		coalesce(sum(`+normalizedInputExpr+`), 0),
+		coalesce(sum(` + normalizedInputExpr + `), 0),
 	coalesce(sum(output_tokens), 0),
-	coalesce(sum(`+compatCachedExpr+`), 0),
+	coalesce(sum(` + compatCachedExpr + `), 0),
 	coalesce(sum(cache_read_tokens), 0),
 	coalesce(sum(cache_creation_tokens), 0),
 	coalesce(sum(total_tokens), 0),
 	avg(nullif(latency_ms, 0)),
 	max(latency_ms)
-from usage_events `+where+`
+from usage_events ` + where + `
 group by bucket_key, source_hash, auth_index
 order by max(timestamp_ms) desc
-limit 500`, args...)
+limit 500`
+	if r.isMySQL() {
+		// The source columns are unbounded. Raise this statement's aggregation
+		// limit so MySQL cannot silently apply its 1 KiB GROUP_CONCAT default.
+		query = strings.Replace(query, "select\n", "select /*+ SET_VAR(group_concat_max_len = 1073741824) */\n", 1)
+	}
+	rows, err := r.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2521,9 +2537,9 @@ func (r *repository) RecentFailuresWithFilter(ctx context.Context, filter Analyt
 		return nil, nil
 	}
 	filter.IncludeFailed = true
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	args = append(args, limit)
-	rows, err := r.db.QueryContext(ctx, `select
+	rows, err := r.queryContext(ctx, `select
 	timestamp_ms,
 		`+usageidentity.SQLRequestAnalyticsModelExpression("model", "requested_model")+` as model,
 	coalesce(api_key_hash, ''),
@@ -2593,9 +2609,9 @@ limit ?`, args...)
 }
 
 func (r *repository) EventsCountWithFilter(ctx context.Context, filter AnalyticsFilter) (int64, error) {
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	var total int64
-	if err := r.db.QueryRowContext(ctx, `select count(*) from usage_events `+where, args...).Scan(&total); err != nil {
+	if err := r.queryRowContext(ctx, `select count(*) from usage_events `+where, args...).Scan(&total); err != nil {
 		return 0, err
 	}
 	return total, nil
@@ -2606,7 +2622,7 @@ func (r *repository) EventsPageWithFilter(ctx context.Context, filter AnalyticsF
 		return EventsPage{}, nil
 	}
 	queryLimit := limit + 1
-	where, args := analyticsWhere(filter)
+	where, args := analyticsWhere(filter, r.isMySQL())
 	// Keyset pagination cursor. The non-unique timestamp index implicitly
 	// carries the rowid (id is "integer primary key"), so ordering by
 	// (timestamp_ms desc, id desc) stays index-backed. Using the compound
@@ -2624,7 +2640,7 @@ func (r *repository) EventsPageWithFilter(ctx context.Context, filter AnalyticsF
 		}
 	}
 	args = append(args, queryLimit)
-	rows, err := r.db.QueryContext(ctx, `select
+	rows, err := r.queryContext(ctx, `select
 	id,
 	coalesce(request_id, ''),
 	event_hash,
@@ -2789,7 +2805,7 @@ func (r *repository) LatestHeaderSnapshots(ctx context.Context, sinceMS int64, l
 	if limit <= 0 {
 		return nil, nil
 	}
-	rows, err := r.db.QueryContext(ctx, `with candidates as (
+	rows, err := r.queryContext(ctx, `with candidates as (
 	select
 		id,
 		event_hash,
@@ -2840,7 +2856,10 @@ func (r *repository) LatestHeaderSnapshots(ctx context.Context, sinceMS int64, l
 		or coalesce(source_hash, '') <> ''
 	)
 ), ranked as (
-	select *, row_number() over (partition by snapshot_key order by timestamp_ms desc, id desc) as rn
+	select candidates.*, row_number() over (
+		partition by candidates.snapshot_key
+		order by candidates.timestamp_ms desc, candidates.id desc
+	) as rn
 	from candidates
 )
 select
@@ -2918,8 +2937,8 @@ func (r *repository) ActiveDaysWithFilter(ctx context.Context, filter AnalyticsF
 	if location == nil {
 		location = time.UTC
 	}
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, `select timestamp_ms from usage_events `+where, args...)
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, `select timestamp_ms from usage_events `+where, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -2940,8 +2959,8 @@ func (r *repository) ActiveDaysWithFilter(ctx context.Context, filter AnalyticsF
 }
 
 func (r *repository) ZeroTokenModelsWithFilter(ctx context.Context, filter AnalyticsFilter) ([]string, error) {
-	where, args := analyticsWhere(filter)
-	rows, err := r.db.QueryContext(ctx, `select distinct `+usageidentity.SQLRequestAnalyticsModelExpression("model", "requested_model")+` as analytics_model
+	where, args := analyticsWhere(filter, r.isMySQL())
+	rows, err := r.queryContext(ctx, `select distinct `+usageidentity.SQLRequestAnalyticsModelExpression("model", "requested_model")+` as analytics_model
 from usage_events `+where+`
 and total_tokens = 0
 and failed = 0
@@ -2965,22 +2984,26 @@ order by analytics_model`, args...)
 	return models, rows.Err()
 }
 
-func analyticsWhere(filter AnalyticsFilter) (string, []any) {
+func analyticsWhere(filter AnalyticsFilter, mysql ...bool) (string, []any) {
 	conditions := []string{"timestamp_ms >= ?", "timestamp_ms < ?"}
 	args := []any{filter.FromMS, filter.ToMS}
 
 	query := strings.TrimSpace(strings.ToLower(filter.SearchQuery))
 	hash := strings.TrimSpace(strings.ToLower(filter.SearchAPIKeyHash))
 	if query != "" {
-		like := "%" + query + "%"
 		searchConditions := make([]string, 0, len(analyticsSearchTextColumns)+1)
 		for _, column := range analyticsSearchTextColumns {
 			expression := column
 			if column == "analytics_model" {
 				expression = usageidentity.SQLRequestAnalyticsModelExpression("model", "requested_model")
 			}
-			searchConditions = append(searchConditions, fmt.Sprintf("lower(coalesce(%s, '')) like ?", expression))
-			args = append(args, like)
+			if len(mysql) > 0 && mysql[0] {
+				searchConditions = append(searchConditions, fmt.Sprintf("locate(lower(?), lower(coalesce(%s, ''))) > 0", expression))
+				args = append(args, query)
+			} else {
+				searchConditions = append(searchConditions, fmt.Sprintf("lower(coalesce(%s, '')) like ?", expression))
+				args = append(args, "%"+query+"%")
+			}
 		}
 		if hash != "" {
 			searchConditions = append(searchConditions, "lower(coalesce(api_key_hash, '')) = ?")

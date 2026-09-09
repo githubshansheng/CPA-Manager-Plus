@@ -20,6 +20,7 @@ import (
 	collectorsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/collector"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/cpaauthfiles"
 	dashboardsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/dashboard"
+	databasemanagementsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/databasemanagement"
 	managerconfigsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/managerconfig"
 	modelpricesvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/modelprice"
 	monitoringsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/monitoring"
@@ -36,8 +37,23 @@ type AutomationRuntimeService interface {
 	Reload(ctx context.Context) error
 }
 
+type AdminAuthenticationService interface {
+	VerifyHeader(context.Context, string) (bool, error)
+	VerifyPanelHeader(context.Context, string) (bool, error)
+	VerifySubmittedExternalConfigHeader(context.Context, string, store.ManagerConfig) (bool, error)
+	PanelUsesExternalManagementKey(context.Context) (bool, error)
+}
+
 type DatabaseMaintenanceStatusProvider interface {
 	Snapshot() sqliterepo.WALMaintenanceSnapshot
+}
+
+type SQLiteSourceSwitchGuard interface {
+	AcquireSQLiteSourceSwitch(context.Context, uint64) (func(), error)
+}
+
+type RestartRequester interface {
+	RequestRestart() bool
 }
 
 type Context struct {
@@ -51,7 +67,7 @@ type Context struct {
 	Bootstrap bootstrapsvc.Result
 
 	SetupService                   *setupsvc.Service
-	AdminAuthService               *adminauthsvc.Service
+	AdminAuthService               AdminAuthenticationService
 	ManagerConfigService           *managerconfigsvc.Service
 	CollectorService               *collectorsvc.Service
 	UsageService                   *usagesvc.Service
@@ -68,6 +84,9 @@ type Context struct {
 	PanelService                   *panelsvc.Service
 	AutomationRuntimeService       AutomationRuntimeService
 	DatabaseMaintenance            DatabaseMaintenanceStatusProvider
+	DatabaseManagement             databasemanagementsvc.Manager
+	SQLiteSourceSwitchGuard        SQLiteSourceSwitchGuard
+	RestartRequester               RestartRequester
 }
 
 func FromExisting(

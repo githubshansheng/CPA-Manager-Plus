@@ -299,6 +299,16 @@ Manager Server 在整个生命周期内都会持有 `<数据库绝对路径>.man
 
 如果 `USAGE_QUOTA_COOLDOWN_ENABLED`、`USAGE_ACCOUNT_ACTIONS_ENABLED` 或 `USAGE_ACCOUNT_ACTIONS_AUTO_DISABLE` 由环境变量设置，面板中的对应开关会显示为环境变量来源并被锁定。要改成面板可编辑，需要移除环境变量并重启 Manager Server。
 
+## 自定义页面
+
+Manager Server 托管面板可以把外部 Web 页面作为侧栏子菜单嵌入。打开“配置面板 → CPA Manager Plus 配置 → 自定义菜单配置”，添加菜单名称和页面地址，并用上移、下移按钮调整顺序。保存后，侧栏会出现“自定义页面”父菜单；每个子菜单在面板内容区的 iframe 中打开。
+
+- 仅支持完整的 `http://` 或 `https://` 地址，不接受在 URL 中内嵌账号或密码。
+- iframe 不获得剪贴板权限，也不能导航顶层面板；脚本、表单、下载、弹窗和同源能力仍按受限 sandbox 规则运行。
+- 目标网站若通过 `X-Frame-Options` 或 CSP `frame-ancestors` 禁止嵌入，浏览器会拒绝显示，CPAMP 无法绕过该限制。
+- 菜单地址会作为 Manager Server 配置保存。不要把访问令牌、API Key 或其他敏感信息放入 URL 或查询参数。
+- 该功能只在 Manager Server 托管的完整面板中可用；CPA 直接托管的轻量面板不会读取这份配置。
+
 ::: details 高级：运行时接口
 
 ## 运行时接口

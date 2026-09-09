@@ -28,6 +28,7 @@ const fetchConfigMock = vi.fn();
 const clearConfigCacheMock = vi.fn();
 const clearModelsCacheMock = vi.fn();
 const usageServiceGetManagerConfigMock = vi.fn();
+const usageServiceGetStatusMock = vi.fn();
 
 vi.mock('@/services/api/client', () => ({
   apiClient: {
@@ -61,6 +62,7 @@ vi.mock('@/services/api/usageService', async () => {
     usageServiceApi: {
       ...actual.usageServiceApi,
       getManagerConfig: usageServiceGetManagerConfigMock,
+      getStatus: usageServiceGetStatusMock,
     },
   };
 });
@@ -99,6 +101,8 @@ describe('useAuthStore logout', () => {
     clearConfigCacheMock.mockClear();
     clearModelsCacheMock.mockClear();
     usageServiceGetManagerConfigMock.mockReset();
+    usageServiceGetStatusMock.mockReset();
+    usageServiceGetStatusMock.mockResolvedValue({});
     storage = createMemoryStorage();
     vi.stubGlobal('localStorage', storage);
     vi.stubGlobal('window', createStubWindow('cpa.local:8317'));
@@ -133,6 +137,7 @@ describe('useAuthStore logout', () => {
       serverVersion: 'v7.2.93',
       serverCommit: '5bffd151',
       serverBuildDate: '2026-08-17',
+      recoveryMode: 'database_recovery',
       connectionStatus: 'connected',
     });
     storage.setItem('isLoggedIn', 'true');
@@ -153,6 +158,7 @@ describe('useAuthStore logout', () => {
       serverVersion: null,
       serverCommit: null,
       serverBuildDate: null,
+      recoveryMode: '',
       connectionStatus: 'disconnected',
     });
     expect(storage.getItem('isLoggedIn')).toBeNull();
@@ -169,6 +175,8 @@ describe('useAuthStore manager embedded login recovery', () => {
     clearConfigCacheMock.mockClear();
     clearModelsCacheMock.mockClear();
     usageServiceGetManagerConfigMock.mockReset();
+    usageServiceGetStatusMock.mockReset();
+    usageServiceGetStatusMock.mockResolvedValue({});
     storage = createMemoryStorage();
     vi.stubGlobal('localStorage', storage);
     vi.stubGlobal('window', createStubWindow('manager.local:18317'));
@@ -267,6 +275,47 @@ describe('useAuthStore manager embedded login recovery', () => {
       isAuthenticated: false,
       connectionStatus: 'error',
     });
+  });
+
+  it('recognizes the authenticated database recovery status from a hosted panel', async () => {
+    fetchConfigMock.mockRejectedValue(new Error('database management is unavailable'));
+    usageServiceGetStatusMock.mockResolvedValue({
+      service: 'cpa-manager-plus',
+      recoveryMode: true,
+      databaseTopology: { writePrimary: 'mysql' },
+    });
+
+    const { useAuthStore } = await import('./useAuthStore');
+    const { useUsageServiceStore } = await import('./useUsageServiceStore');
+
+    const result = await useAuthStore.getState().login({
+      apiBase: 'http://manager.local:18317',
+      managementKey: 'manager-admin-key',
+      sessionMode: 'external_panel',
+      sessionPanelBase: 'http://manager.local:18317',
+    });
+
+    expect(result).toEqual({ recoveryMode: 'database_recovery' });
+    expect(usageServiceGetStatusMock).toHaveBeenCalledWith(
+      'http://manager.local:18317',
+      'manager-admin-key'
+    );
+    expect(usageServiceGetManagerConfigMock).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({
+      isAuthenticated: true,
+      apiBase: 'http://manager.local:18317',
+      managementKey: 'manager-admin-key',
+      sessionMode: 'manager_embedded',
+      recoveryMode: 'database_recovery',
+      connectionStatus: 'connected',
+    });
+    expect(useUsageServiceStore.getState()).toMatchObject({
+      enabled: true,
+      serviceBase: 'http://manager.local:18317',
+      panelBase: 'http://manager.local:18317',
+      panelHostMode: 'manager_embedded',
+    });
+    expect(clearConfigCacheMock).toHaveBeenCalled();
   });
 });
 

@@ -301,6 +301,16 @@ See the [July 10, 2026 Performance Optimization Report](./performance-optimizati
 
 When `USAGE_QUOTA_COOLDOWN_ENABLED`, `USAGE_ACCOUNT_ACTIONS_ENABLED`, or `USAGE_ACCOUNT_ACTIONS_AUTO_DISABLE` is set through the environment, the matching panel switch is shown as environment-sourced and locked. Remove the environment variable and restart Manager Server if you want the setting to be editable from the panel.
 
+## Custom Pages
+
+The Manager Server-hosted panel can embed external web pages as sidebar submenu items. Open **Config Panel → CPA Manager Plus Config → Custom menu configuration**, add a menu name and page URL, and use the move-up and move-down controls to set the order. After saving, the sidebar shows a **Custom Pages** parent menu, and each submenu opens its URL in an iframe inside the panel content area.
+
+- Only complete `http://` or `https://` URLs are accepted. Usernames and passwords embedded in a URL are rejected.
+- The iframe receives no clipboard permission and cannot navigate the top-level panel. Scripts, forms, downloads, popups, and same-origin access still run within the declared sandbox restrictions.
+- If the target site blocks embedding through `X-Frame-Options` or CSP `frame-ancestors`, the browser refuses to display it. CPAMP cannot bypass that policy.
+- Page URLs are saved as Manager Server configuration. Do not place access tokens, API keys, or other secrets in URLs or query strings.
+- This feature is available only in the full Manager Server-hosted panel. The CPA-hosted Lightweight Panel does not read this configuration.
+
 ::: details Advanced: runtime endpoints
 
 ## Runtime Endpoints

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageevent"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
@@ -15,10 +16,11 @@ func (r *repository) LoadAccountWindowStats(ctx context.Context, windows []Accou
 	if len(windows) == 0 {
 		return []AccountWindowModelStat{}, State{}, true, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	state, available, projectionComplete, err := projectionReadState(ctx, tx)
 	if err != nil || !available {
@@ -56,8 +58,23 @@ type accountWindowStatKey struct {
 	serviceTier      string
 }
 
-func mergeProjectedAccountWindowStats(ctx context.Context, tx *sql.Tx, windows []AccountWindowUsageQuery, projectionCoverageEventID int64, projectionComplete bool, statsCoverageEventID int64, dailyAvailable bool, grouped map[accountWindowStatKey]*AccountWindowModelStat) error {
-	source, args := accountWindowEventSourceSQL(windows, projectionCoverageEventID, projectionComplete, statsCoverageEventID, dailyAvailable)
+func mergeProjectedAccountWindowStats(
+	ctx context.Context,
+	tx *dialect.Tx,
+	windows []AccountWindowUsageQuery,
+	projectionCoverageEventID int64,
+	projectionComplete bool,
+	statsCoverageEventID int64,
+	dailyAvailable bool,
+	grouped map[accountWindowStatKey]*AccountWindowModelStat,
+) error {
+	source, args := accountWindowEventSourceSQL(
+		windows,
+		projectionCoverageEventID,
+		projectionComplete,
+		statsCoverageEventID,
+		dailyAvailable,
+	)
 	query := fmt.Sprintf(`%s
 		select request_index, analytics_model, billing_model_value, pricing_model_value,
 		context_threshold_tokens_value, coalesce(service_tier, ''), count(*),
@@ -84,7 +101,13 @@ func mergeProjectedAccountWindowStats(ctx context.Context, tx *sql.Tx, windows [
 	return mergeAccountWindowStatRows(rows, grouped)
 }
 
-func mergeStoredAccountWindowStats(ctx context.Context, tx *sql.Tx, revision string, windows []AccountWindowUsageQuery, grouped map[accountWindowStatKey]*AccountWindowModelStat) error {
+func mergeStoredAccountWindowStats(
+	ctx context.Context,
+	tx *dialect.Tx,
+	revision string,
+	windows []AccountWindowUsageQuery,
+	grouped map[accountWindowStatKey]*AccountWindowModelStat,
+) error {
 	values := make([]string, 0, len(windows))
 	args := make([]any, 0, len(windows)*8+1)
 	for _, window := range windows {
@@ -101,7 +124,11 @@ func mergeStoredAccountWindowStats(ctx context.Context, tx *sql.Tx, revision str
 			codexMember, _ = usageidentity.NormalizeCodexMemberSnapshot(window.AccountSnapshot)
 		}
 		accountKey, legacyAccountKey := accountWindowKeys(window)
-		values = append(values, "(?, ?, ?, ?, ?, ?, ?, ?)")
+		valueRow := "(?, ?, ?, ?, ?, ?, ?, ?)"
+		if tx.IsMySQL() {
+			valueRow = "row" + valueRow
+		}
+		values = append(values, valueRow)
 		args = append(args,
 			window.RequestIndex,
 			fullStartMS,

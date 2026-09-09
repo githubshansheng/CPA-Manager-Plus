@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
@@ -138,11 +140,37 @@ type accountKey struct {
 
 type repository struct {
 	db          *sql.DB
+	dialect     dialect.Dialect
 	catchUpGate chan struct{}
 }
 
 func New(db *sql.DB) Repository {
-	return &repository{db: db, catchUpGate: make(chan struct{}, 1)}
+	return NewSQLite(db)
+}
+
+func NewSQLite(db *sql.DB) Repository {
+	return newForBackend(db, database.BackendSQLite)
+}
+
+func NewMySQL(db *sql.DB) (Repository, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := dialect.ValidateMySQLSession(ctx, db); err != nil {
+		return nil, fmt.Errorf("validate usage pricing mysql session: %w", err)
+	}
+	return newForBackend(db, database.BackendMySQL), nil
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return newForBackend(db, backend)
+}
+
+func newForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return &repository{
+		db:          db,
+		dialect:     dialect.ForBackend(backend),
+		catchUpGate: make(chan struct{}, 1),
+	}
 }
 
 func (r *repository) CatchUp(ctx context.Context, limit int, nowMS int64) (CatchUpResult, error) {
@@ -157,10 +185,11 @@ func (r *repository) CatchUp(ctx context.Context, limit int, nowMS int64) (Catch
 	}
 	defer r.releaseCatchUp()
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	rawTx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return CatchUpResult{}, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `update usage_pricing_rollup_state set
 		last_run_started_at_ms = ?
@@ -366,7 +395,7 @@ func (r *repository) State(ctx context.Context) (State, error) {
 	return stateQuery(ctx, r.db)
 }
 
-func resetForRevision(ctx context.Context, tx *sql.Tx, revision string, latestID, nowMS int64) error {
+func resetForRevision(ctx context.Context, tx *dialect.Tx, revision string, latestID, nowMS int64) error {
 	if _, err := tx.ExecContext(ctx, `update usage_pricing_rollup_state set
 		structure_revision = ?,
 		status = 'clearing',
@@ -386,16 +415,20 @@ func resetForRevision(ctx context.Context, tx *sql.Tx, revision string, latestID
 	return nil
 }
 
-func clearRevisionRowsBatch(ctx context.Context, tx *sql.Tx, revision string, limit int) (bool, error) {
+func clearRevisionRowsBatch(ctx context.Context, tx *dialect.Tx, revision string, limit int) (bool, error) {
 	remaining := limit
 	for _, tableName := range []string{
 		"usage_pricing_hourly_rollups_v1",
 		"usage_pricing_account_rollups_v1",
 	} {
 		if remaining > 0 {
-			result, err := tx.ExecContext(ctx, `delete from `+tableName+` where rowid in (
-				select rowid from `+tableName+` where structure_revision = ? limit ?
-			)`, revision, remaining)
+			deleteQuery := `delete from ` + tableName + ` where rowid in (
+				select rowid from ` + tableName + ` where structure_revision = ? limit ?
+			)`
+			if tx.IsMySQL() {
+				deleteQuery = "delete from " + tableName + " where structure_revision = ? limit ?"
+			}
+			result, err := tx.ExecContext(ctx, deleteQuery, revision, remaining)
 			if err != nil {
 				return false, fmt.Errorf("clear pricing revision rows %s: %w", tableName, err)
 			}
@@ -485,7 +518,7 @@ func StructureRevision(ctx context.Context, db RowQuerier) (string, error) {
 	return usageidentity.PricingStructureRevision(model.ModelPriceStructureRevision(prices)), nil
 }
 
-func latestEventID(ctx context.Context, tx *sql.Tx) (int64, error) {
+func latestEventID(ctx context.Context, tx *dialect.Tx) (int64, error) {
 	var id int64
 	if err := tx.QueryRowContext(ctx, `select coalesce(max(id), 0) from usage_events`).Scan(&id); err != nil {
 		return 0, err
@@ -493,7 +526,7 @@ func latestEventID(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return id, nil
 }
 
-func eventIDsThrough(ctx context.Context, tx *sql.Tx, lastEventID, targetEventID int64, limit int) ([]int64, error) {
+func eventIDsThrough(ctx context.Context, tx *dialect.Tx, lastEventID, targetEventID int64, limit int) ([]int64, error) {
 	if targetEventID <= lastEventID {
 		return []int64{}, nil
 	}
@@ -513,7 +546,7 @@ func eventIDsThrough(ctx context.Context, tx *sql.Tx, lastEventID, targetEventID
 	return ids, rows.Err()
 }
 
-func batchBucketRange(ctx context.Context, tx *sql.Tx, afterID, throughID int64) (sql.NullInt64, sql.NullInt64, error) {
+func batchBucketRange(ctx context.Context, tx *dialect.Tx, afterID, throughID int64) (sql.NullInt64, sql.NullInt64, error) {
 	var minBucket, maxBucket sql.NullInt64
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`select
 		min(timestamp_ms - (timestamp_ms %% %d)),
@@ -568,7 +601,7 @@ func bandedEventsCTE(whereClause string) string {
 		)`, requestedModelExpression, analyticsModelExpression, analyticsModelExpression, accountKeyExpression, whereClause, model.ModelPriceBaseContextThreshold)
 }
 
-func upsertHourlyBatch(ctx context.Context, tx *sql.Tx, revision string, afterID, throughID, nowMS int64) error {
+func upsertHourlyBatch(ctx context.Context, tx *dialect.Tx, revision string, afterID, throughID, nowMS int64) error {
 	query := bandedEventsCTE("e.id > ? and e.id <= ?") + fmt.Sprintf(`
 	insert into usage_pricing_hourly_rollups_v1 (
 		structure_revision, bucket_ms, model, billing_model, pricing_model,
@@ -639,7 +672,7 @@ func upsertHourlyBatch(ctx context.Context, tx *sql.Tx, revision string, afterID
 	return err
 }
 
-func upsertAccountBatch(ctx context.Context, tx *sql.Tx, revision string, afterID, throughID, nowMS int64) error {
+func upsertAccountBatch(ctx context.Context, tx *dialect.Tx, revision string, afterID, throughID, nowMS int64) error {
 	query := bandedEventsCTE("e.id > ? and e.id <= ?") + fmt.Sprintf(`
 	insert into usage_pricing_account_rollups_v1 (
 		structure_revision, account_key, account_snapshot, auth_label_snapshot,
@@ -743,6 +776,10 @@ func (r *repository) LoadHourlyRows(ctx context.Context, filter HourlyFilter) ([
 }
 
 func (r *repository) LoadHourlyRowsTx(ctx context.Context, tx *sql.Tx, filter HourlyFilter) ([]HourlyRow, State, bool, error) {
+	return r.loadHourlyRowsTx(ctx, dialect.WrapTx(tx, r.dialect), filter)
+}
+
+func (r *repository) loadHourlyRowsTx(ctx context.Context, tx *dialect.Tx, filter HourlyFilter) ([]HourlyRow, State, bool, error) {
 	if filter.FromMS >= filter.ToMS {
 		state, err := stateQuery(ctx, tx)
 		return []HourlyRow{}, state, err == nil && state.SchemaVersion == SchemaVersion, err
@@ -792,7 +829,7 @@ func (r *repository) LoadHourlyRowsTx(ctx context.Context, tx *sql.Tx, filter Ho
 
 func mergeStoredHourlyRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	revision string,
 	filter HourlyFilter,
 	fromMS int64,
@@ -825,7 +862,7 @@ func mergeStoredHourlyRows(
 
 func mergeRawHourlyRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	filter HourlyFilter,
 	fromMS int64,
 	toMS int64,
@@ -1018,6 +1055,10 @@ func (r *repository) LoadAccountRows(ctx context.Context, accountKeys []string) 
 }
 
 func (r *repository) LoadAccountRowsTx(ctx context.Context, tx *sql.Tx, accountKeys []string) ([]AccountRow, State, bool, error) {
+	return r.loadAccountRowsTx(ctx, dialect.WrapTx(tx, r.dialect), accountKeys)
+}
+
+func (r *repository) loadAccountRowsTx(ctx context.Context, tx *dialect.Tx, accountKeys []string) ([]AccountRow, State, bool, error) {
 	keys := normalizeValues(accountKeys)
 	if len(keys) == 0 {
 		state, err := stateQuery(ctx, tx)
@@ -1054,7 +1095,7 @@ func (r *repository) LoadAccountRowsTx(ctx context.Context, tx *sql.Tx, accountK
 
 func mergeStoredAccountRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	revision string,
 	accountKeys []string,
 	grouped map[accountKey]*AccountRow,
@@ -1092,7 +1133,7 @@ func mergeStoredAccountRows(
 
 func mergeRawAccountRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	afterID int64,
 	accountKeys []string,
 	grouped map[accountKey]*AccountRow,

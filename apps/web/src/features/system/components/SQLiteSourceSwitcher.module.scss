@@ -1,0 +1,194 @@
+@use '@/styles/variables' as v;
+
+.root {
+  display: grid;
+  gap: v.$spacing-md;
+  margin-top: v.$spacing-lg;
+  padding-top: v.$spacing-lg;
+  border-top: 1px solid var(--app-border);
+}
+
+.header,
+.pending {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: v.$spacing-md;
+}
+
+.header > div,
+.pending > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.header h3,
+.header p,
+.pending strong,
+.pending span,
+.warning p,
+.confirmation p {
+  margin: 0;
+}
+
+.header h3 {
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.header p,
+.pending span,
+.safetyHint,
+.confirmation p {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.pathList,
+.preflight dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: v.$spacing-sm;
+  margin: 0;
+}
+
+.pathList > div,
+.preflight dl > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  padding: v.$spacing-sm v.$spacing-md;
+  border-radius: var(--app-radius-sm);
+  background: var(--surface-subtle);
+}
+
+.pathList dt,
+.preflight dt {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.pathList dd,
+.preflight dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.safetyNotice,
+.warning,
+.requiredParameters,
+.pending,
+.preflight,
+.error,
+.status {
+  padding: v.$spacing-md;
+  border-radius: var(--app-radius-sm);
+  font-size: 12px;
+}
+
+.safetyNotice,
+.warning,
+.requiredParameters {
+  border: 1px solid color-mix(in srgb, #f59e0b 42%, var(--border-subtle));
+  background: color-mix(in srgb, #f59e0b 9%, var(--surface-subtle));
+  color: var(--text-secondary);
+}
+
+.safetyNotice ul,
+.requiredParameters ul {
+  display: grid;
+  gap: 4px;
+  margin: v.$spacing-xs 0 0;
+  padding-left: 1.25rem;
+}
+
+.safetyHint {
+  margin: 0;
+}
+
+.pending,
+.preflight,
+.status {
+  border: 1px solid color-mix(in srgb, var(--color-primary) 32%, var(--border-subtle));
+  background: color-mix(in srgb, var(--color-primary) 7%, var(--surface-subtle));
+}
+
+.pending strong,
+.preflight > strong {
+  color: var(--text-primary);
+}
+
+.status {
+  color: var(--text-primary);
+}
+
+.modalBody {
+  display: grid;
+  gap: v.$spacing-md;
+}
+
+.warning {
+  display: flex;
+  align-items: flex-start;
+  gap: v.$spacing-sm;
+}
+
+.warning svg {
+  flex: 0 0 auto;
+  color: #f59e0b;
+}
+
+.warning > div {
+  display: grid;
+  gap: 4px;
+}
+
+.warning strong,
+.requiredParameters strong {
+  color: #f59e0b;
+}
+
+.preflight {
+  display: grid;
+  gap: v.$spacing-sm;
+}
+
+.confirmation {
+  display: grid;
+  gap: v.$spacing-sm;
+  padding: v.$spacing-md;
+  border: 1px solid color-mix(in srgb, #ef4444 42%, var(--border-subtle));
+  border-radius: var(--app-radius-sm);
+  background: color-mix(in srgb, #ef4444 8%, var(--surface-subtle));
+}
+
+.error {
+  display: grid;
+  gap: 4px;
+  background: color-mix(in srgb, #ef4444 10%, var(--surface-subtle));
+  color: #ef4444;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 620px) {
+  .header,
+  .pending {
+    flex-direction: column;
+  }
+
+  .header > span,
+  .pending > span {
+    width: 100%;
+  }
+
+  .pathList,
+  .preflight dl {
+    grid-template-columns: 1fr;
+  }
+}

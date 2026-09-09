@@ -150,6 +150,24 @@ func TestCodexLegacyIdentityEvidenceMigrationRecoversMissingDerivation(t *testin
 	}
 }
 
+func TestCodexLegacyIdentityCatchUpInitializesMissingState(t *testing.T) {
+	db, st := newMonitoringRepositoryStore(t)
+	seedCodexLegacyIdentityEvents(t, db, 3)
+	if _, err := db.Exec(`delete from usage_monitoring_rollup_state
+		where rollup_name = 'codex_legacy_identity_v1'`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := st.CatchUpCodexLegacyIdentityEvidence(context.Background(), 1000, 1)
+	if err != nil || result.Processed != 3 || result.Pending || result.CoverageEventID != 3 {
+		t.Fatalf("catch-up after missing state = %+v err=%v", result, err)
+	}
+	state, err := st.UsageMonitoringState(context.Background(), usageevent.CodexLegacyIdentityRollupName)
+	if err != nil || state.StructureRevision != usageevent.CodexLegacyIdentityEvidenceRevision ||
+		state.Status != "ready" || state.CoverageEventID != 3 {
+		t.Fatalf("initialized state = %+v err=%v", state, err)
+	}
+}
+
 func seedCodexLegacyIdentityEvents(t testing.TB, db *sql.DB, count int64) {
 	t.Helper()
 	_, err := db.Exec(`with recursive ids(id) as (

@@ -107,10 +107,13 @@ func (r *repository) RecentAccountRequests(
 
 func (r *repository) latestRequestIndexesReady(ctx context.Context) (bool, error) {
 	var count int
-	err := r.db.QueryRowContext(ctx, `select count(*) from sqlite_master
-		where type = 'index'
-			and tbl_name = 'usage_events'
-			and name in (?, ?)`,
+	query := `select count(*) from sqlite_master
+		where type = 'index' and tbl_name = 'usage_events' and name in (?, ?)`
+	if r.isMySQL() {
+		query = `select count(distinct index_name) from information_schema.statistics
+			where table_schema = database() and table_name = 'usage_events' and index_name in (?, ?)`
+	}
+	err := r.queryRowContext(ctx, query,
 		latestRequestAuthFileIndex,
 		latestRequestSourceIndex,
 	).Scan(&count)
@@ -345,7 +348,7 @@ func (r *repository) recentAccountRequestsByPredicate(
 	predicate latestRequestPredicate,
 ) ([]rankedAccountRequest, error) {
 	args := append(append([]any{}, predicate.args...), limit)
-	rows, err := r.db.QueryContext(ctx, `select
+	rows, err := r.queryContext(ctx, `select
 	e.id,
 	e.timestamp_ms,
 	e.failed,
@@ -391,8 +394,8 @@ func (r *repository) recentAccountRequestsBatched(
 	targets []LatestAccountRequestQuery,
 	limit int,
 ) ([]LatestAccountRequest, error) {
-	values := make([]string, 0, len(targets))
 	args := make([]any, 0, len(targets)*8+1)
+	rowCount := 0
 	for _, target := range targets {
 		authFileSnapshot := strings.TrimSpace(target.AuthFileSnapshot)
 		if authFileSnapshot == "" {
@@ -411,7 +414,7 @@ func (r *repository) recentAccountRequestsBatched(
 				identityMode = 1
 			}
 		}
-		values = append(values, "(?, ?, ?, ?, ?, ?, ?, ?)")
+		rowCount++
 		args = append(
 			args,
 			target.RequestIndex,
@@ -424,15 +427,15 @@ func (r *repository) recentAccountRequestsBatched(
 			identityMode,
 		)
 	}
-	if len(values) == 0 {
+	if rowCount == 0 {
 		return []LatestAccountRequest{}, nil
 	}
 	args = append(args, limit)
 
-	rows, err := r.db.QueryContext(ctx, `with credential_targets(
+	rows, err := r.queryContext(ctx, `with credential_targets(
 	request_index, auth_file_snapshot, auth_index, provider, workspace_id, member, project_id, identity_mode
 ) as (
-	values `+strings.Join(values, ",")+`
+	`+r.valuesCTE(8, rowCount)+`
 ), snapshot_candidates as (
 	select
 		t.request_index,
@@ -503,7 +506,7 @@ order by request_index, row_number`, args...)
 	}
 	defer rows.Close()
 
-	requests := make([]LatestAccountRequest, 0, len(values)*limit)
+	requests := make([]LatestAccountRequest, 0, rowCount*limit)
 	for rows.Next() {
 		var request LatestAccountRequest
 		var failed int

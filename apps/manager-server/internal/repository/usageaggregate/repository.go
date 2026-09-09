@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
@@ -96,12 +98,39 @@ type rowKey struct {
 
 type repository struct {
 	db          *sql.DB
+	dialect     dialect.Dialect
 	catchUpGate chan struct{}
 }
 
 func New(db *sql.DB) Repository {
+	return NewSQLite(db)
+}
+
+func NewSQLite(db *sql.DB) Repository {
 	return &repository{
 		db:          db,
+		dialect:     dialect.SQLite(),
+		catchUpGate: make(chan struct{}, 1),
+	}
+}
+
+func NewMySQL(db *sql.DB) (Repository, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := dialect.ValidateMySQLSession(ctx, db); err != nil {
+		return nil, fmt.Errorf("validate usage aggregate mysql session: %w", err)
+	}
+	return newForBackend(db, database.BackendMySQL), nil
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return newForBackend(db, backend)
+}
+
+func newForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return &repository{
+		db:          db,
+		dialect:     dialect.ForBackend(backend),
 		catchUpGate: make(chan struct{}, 1),
 	}
 }
@@ -118,10 +147,11 @@ func (r *repository) CatchUp(ctx context.Context, limit int, nowMS int64) (Catch
 	}
 	defer r.releaseCatchUp()
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	rawTx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return CatchUpResult{}, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	// Acquire SQLite's writer slot before reading the checkpoint so a
 	// concurrent usage insert cannot invalidate a deferred read snapshot when
@@ -319,6 +349,10 @@ func (r *repository) LoadRows(ctx context.Context, filter Filter) ([]Row, State,
 }
 
 func (r *repository) LoadRowsTx(ctx context.Context, tx *sql.Tx, filter Filter) ([]Row, State, bool, error) {
+	return r.loadRowsTx(ctx, dialect.WrapTx(tx, r.dialect), filter)
+}
+
+func (r *repository) loadRowsTx(ctx context.Context, tx *dialect.Tx, filter Filter) ([]Row, State, bool, error) {
 	if filter.FromMS >= filter.ToMS {
 		state, err := stateQuery(ctx, tx, AggregateName)
 		return []Row{}, state, err == nil && state.SchemaVersion == SchemaVersion, err
@@ -414,7 +448,7 @@ func stateQuery(ctx context.Context, db stateQuerier, name string) (State, error
 	return state, nil
 }
 
-func latestEventID(ctx context.Context, tx *sql.Tx) (int64, error) {
+func latestEventID(ctx context.Context, tx *dialect.Tx) (int64, error) {
 	var id int64
 	if err := tx.QueryRowContext(ctx, `select coalesce(max(id), 0) from usage_events`).Scan(&id); err != nil {
 		return 0, err
@@ -422,7 +456,7 @@ func latestEventID(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return id, nil
 }
 
-func eventIDsThrough(ctx context.Context, tx *sql.Tx, lastEventID, targetEventID int64, limit int) ([]int64, error) {
+func eventIDsThrough(ctx context.Context, tx *dialect.Tx, lastEventID, targetEventID int64, limit int) ([]int64, error) {
 	if targetEventID <= lastEventID {
 		return []int64{}, nil
 	}
@@ -442,7 +476,7 @@ func eventIDsThrough(ctx context.Context, tx *sql.Tx, lastEventID, targetEventID
 	return ids, rows.Err()
 }
 
-func upsertAggregateBatch(ctx context.Context, tx *sql.Tx, structureRevision string, afterID, throughID, nowMS int64) error {
+func upsertAggregateBatch(ctx context.Context, tx *dialect.Tx, structureRevision string, afterID, throughID, nowMS int64) error {
 	_, err := tx.ExecContext(ctx, fmt.Sprintf(`insert into usage_hourly_aggregate_v1 (
 		bucket_ms,
 		model,
@@ -529,8 +563,8 @@ func upsertAggregateBatch(ctx context.Context, tx *sql.Tx, structureRevision str
 	return err
 }
 
-func upsertIdentityLedgerBatch(ctx context.Context, tx *sql.Tx, structureRevision string, afterID, throughID, nowMS int64) (int64, error) {
-	insertResult, err := tx.ExecContext(ctx, fmt.Sprintf(`insert or ignore into usage_event_identity_ledger (
+func upsertIdentityLedgerBatch(ctx context.Context, tx *dialect.Tx, structureRevision string, afterID, throughID, nowMS int64) (int64, error) {
+	insertQuery := fmt.Sprintf(`insert or ignore into usage_event_identity_ledger (
 		event_hash,
 		raw_event_id,
 		timestamp_ms,
@@ -544,7 +578,12 @@ func upsertIdentityLedgerBatch(ctx context.Context, tx *sql.Tx, structureRevisio
 		case when created_at_ms > 0 then created_at_ms else ? end,
 		?
 	from usage_events
-	where id > ? and id <= ?`, hourMS), SchemaVersion, structureRevision, nowMS, nowMS, afterID, throughID)
+	where id > ? and id <= ?`, hourMS)
+	if tx.IsMySQL() {
+		insertQuery = strings.Replace(insertQuery, "insert or ignore into", "insert into", 1) +
+			" on duplicate key update event_hash = values(event_hash)"
+	}
+	insertResult, err := tx.ExecContext(ctx, insertQuery, SchemaVersion, structureRevision, nowMS, nowMS, afterID, throughID)
 	if err != nil {
 		return 0, err
 	}
@@ -580,7 +619,7 @@ func upsertIdentityLedgerBatch(ctx context.Context, tx *sql.Tx, structureRevisio
 	return inserted + updated, nil
 }
 
-func batchBucketRange(ctx context.Context, tx *sql.Tx, afterID, throughID int64) (sql.NullInt64, sql.NullInt64, error) {
+func batchBucketRange(ctx context.Context, tx *dialect.Tx, afterID, throughID int64) (sql.NullInt64, sql.NullInt64, error) {
 	var minBucket, maxBucket sql.NullInt64
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`select
 		min(timestamp_ms - (timestamp_ms %% %d)),
@@ -590,7 +629,7 @@ func batchBucketRange(ctx context.Context, tx *sql.Tx, afterID, throughID int64)
 	return minBucket, maxBucket, err
 }
 
-func mergeStoredRows(ctx context.Context, tx *sql.Tx, filter Filter, fromMS, toMS int64, grouped map[rowKey]*Row) error {
+func mergeStoredRows(ctx context.Context, tx *dialect.Tx, filter Filter, fromMS, toMS int64, grouped map[rowKey]*Row) error {
 	conditions, args := aggregateConditions(filter, fromMS, toMS)
 	bucketExpr := "bucket_ms"
 	if filter.CollapseBuckets {
@@ -629,7 +668,7 @@ func mergeStoredRows(ctx context.Context, tx *sql.Tx, filter Filter, fromMS, toM
 	return scanAndMergeRows(rows, grouped)
 }
 
-func mergeRawRows(ctx context.Context, tx *sql.Tx, filter Filter, fromMS, toMS, afterID int64, structureRevision string, excludeAggregated bool, preferEventIDScan bool, grouped map[rowKey]*Row) error {
+func mergeRawRows(ctx context.Context, tx *dialect.Tx, filter Filter, fromMS, toMS, afterID int64, structureRevision string, excludeAggregated bool, preferEventIDScan bool, grouped map[rowKey]*Row) error {
 	query, args := rawRowsStatement(filter, fromMS, toMS, afterID, structureRevision, excludeAggregated, preferEventIDScan)
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {

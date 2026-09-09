@@ -4,9 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/database"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
@@ -71,12 +75,35 @@ type AccountHistoryRow struct {
 
 type repository struct {
 	db          *sql.DB
+	dialect     dialect.Dialect
 	catchUpGate chan struct{}
 }
 
 func New(db *sql.DB) Repository {
+	return NewSQLite(db)
+}
+
+func NewSQLite(db *sql.DB) Repository {
+	return newForBackend(db, database.BackendSQLite)
+}
+
+func NewMySQL(db *sql.DB) (Repository, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := dialect.ValidateMySQLSession(ctx, db); err != nil {
+		return nil, fmt.Errorf("validate usage rollup mysql session: %w", err)
+	}
+	return newForBackend(db, database.BackendMySQL), nil
+}
+
+func NewForBackend(db *sql.DB, backend database.BackendKind) Repository {
+	return newForBackend(db, backend)
+}
+
+func newForBackend(db *sql.DB, backend database.BackendKind) Repository {
 	return &repository{
 		db:          db,
+		dialect:     dialect.ForBackend(backend),
 		catchUpGate: make(chan struct{}, 1),
 	}
 }
@@ -119,10 +146,11 @@ func (r *repository) CatchUpAccountHistory(ctx context.Context, limit int, nowMS
 	}
 	defer r.releaseCatchUp()
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	rawTx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return CatchUpResult{}, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() {
 		_ = tx.Rollback()
 	}()
@@ -233,10 +261,11 @@ func (r *repository) AccountHistoryRows(ctx context.Context, accountKeys []strin
 	if len(keys) == 0 {
 		return []AccountHistoryRow{}, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 
 	checkpoint, err := checkpointInTx(ctx, tx, AccountHistoryCheckpointName)
@@ -266,7 +295,7 @@ func (r *repository) AccountHistoryRows(ctx context.Context, accountKeys []strin
 	return result, nil
 }
 
-func cacheAccountingRawFallbackInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
+func cacheAccountingRawFallbackInTx(ctx context.Context, tx *dialect.Tx) (bool, error) {
 	var status string
 	var appliedRows int64
 	err := tx.QueryRowContext(ctx, `select status, applied_rows
@@ -283,7 +312,7 @@ func cacheAccountingRawFallbackInTx(ctx context.Context, tx *sql.Tx) (bool, erro
 
 func mergeStoredAccountHistoryRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	accountKeys []string,
 	grouped map[accountRollupKey]*AccountHistoryRow,
 ) error {
@@ -333,7 +362,7 @@ order by account_key, last_seen_ms desc`, args...)
 
 func mergeRawAccountHistoryRows(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	afterEventID int64,
 	accountKeys []string,
 	grouped map[accountRollupKey]*AccountHistoryRow,
@@ -500,7 +529,7 @@ where name = ?`, name).Scan(
 	return cp, nil
 }
 
-func checkpointInTx(ctx context.Context, tx *sql.Tx, name string) (Checkpoint, error) {
+func checkpointInTx(ctx context.Context, tx *dialect.Tx, name string) (Checkpoint, error) {
 	var cp Checkpoint
 	var lastError sql.NullString
 	var started, finished sql.NullInt64
@@ -527,7 +556,7 @@ where name = ?`, name).Scan(
 	return cp, nil
 }
 
-func usageRollupRebuildTargetInTx(ctx context.Context, tx *sql.Tx, name string) (int64, error) {
+func usageRollupRebuildTargetInTx(ctx context.Context, tx *dialect.Tx, name string) (int64, error) {
 	var targetEventID int64
 	err := tx.QueryRowContext(ctx, `select target_event_id
 		from usage_rollup_rebuild_state where name = ?`, name).Scan(&targetEventID)
@@ -537,7 +566,7 @@ func usageRollupRebuildTargetInTx(ctx context.Context, tx *sql.Tx, name string) 
 	return targetEventID, err
 }
 
-func setUsageRollupRebuildTargetInTx(ctx context.Context, tx *sql.Tx, name string, targetEventID, nowMS int64) error {
+func setUsageRollupRebuildTargetInTx(ctx context.Context, tx *dialect.Tx, name string, targetEventID, nowMS int64) error {
 	if targetEventID <= 0 {
 		_, err := tx.ExecContext(ctx, `delete from usage_rollup_rebuild_state where name = ?`, name)
 		return err
@@ -550,7 +579,7 @@ func setUsageRollupRebuildTargetInTx(ctx context.Context, tx *sql.Tx, name strin
 	return err
 }
 
-func latestEventIDInTx(ctx context.Context, tx *sql.Tx) (int64, error) {
+func latestEventIDInTx(ctx context.Context, tx *dialect.Tx) (int64, error) {
 	var id int64
 	if err := tx.QueryRowContext(ctx, `select coalesce(max(id), 0) from usage_events`).Scan(&id); err != nil {
 		return 0, err
@@ -558,7 +587,7 @@ func latestEventIDInTx(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return id, nil
 }
 
-func eventsAfterCheckpoint(ctx context.Context, tx *sql.Tx, lastEventID, targetEventID int64, limit int) ([]eventRow, error) {
+func eventsAfterCheckpoint(ctx context.Context, tx *dialect.Tx, lastEventID, targetEventID int64, limit int) ([]eventRow, error) {
 	rows, err := tx.QueryContext(ctx, `select
 	id,
 	timestamp_ms,
@@ -596,7 +625,7 @@ limit ?`, lastEventID, targetEventID, limit)
 
 func accountHistoryEventsAfterCheckpoint(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *dialect.Tx,
 	afterEventID int64,
 	accountKeys []string,
 ) ([]eventRow, error) {
@@ -795,7 +824,7 @@ func fillSnapshotFields(row *AccountHistoryRow, event eventRow) {
 	}
 }
 
-func upsertAccountRollups(ctx context.Context, tx *sql.Tx, rows []AccountHistoryRow) error {
+func upsertAccountRollups(ctx context.Context, tx *dialect.Tx, rows []AccountHistoryRow) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -898,7 +927,7 @@ on conflict(account_key, model, billing_model, service_tier) do update set
 	return nil
 }
 
-func upsertCheckpoint(ctx context.Context, tx *sql.Tx, name string, lastEventID int64, updatedAtMS int64, startedAtMS int64, finishedAtMS int64, lastError string) error {
+func upsertCheckpoint(ctx context.Context, tx *dialect.Tx, name string, lastEventID int64, updatedAtMS int64, startedAtMS int64, finishedAtMS int64, lastError string) error {
 	_, err := tx.ExecContext(ctx, `insert into usage_rollup_checkpoints (
 	name, last_event_id, updated_at_ms, last_error, last_run_started_at_ms, last_run_finished_at_ms
 ) values (?, ?, ?, ?, ?, ?)

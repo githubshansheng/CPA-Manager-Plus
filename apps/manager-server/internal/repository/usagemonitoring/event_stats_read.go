@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/dialect"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
@@ -14,10 +15,11 @@ func (r *repository) LoadAggregate(ctx context.Context, filter AnalyticsFilter) 
 	if !SupportsEventProjectionFilter(filter) {
 		return Aggregate{}, State{}, false, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return Aggregate{}, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	state, available, projectionComplete, err := projectionReadState(ctx, tx)
 	if err != nil || !available {
@@ -102,10 +104,11 @@ func (r *repository) LoadModelStats(ctx context.Context, filter AnalyticsFilter)
 	if !SupportsEventProjectionFilter(filter) {
 		return nil, State{}, false, nil
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	rawTx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, State{}, false, err
 	}
+	tx := dialect.WrapTx(rawTx, r.dialect)
 	defer func() { _ = tx.Rollback() }()
 	state, available, projectionComplete, err := projectionReadState(ctx, tx)
 	if err != nil || !available {
@@ -241,7 +244,7 @@ func (r *repository) LoadModelStats(ctx context.Context, filter AnalyticsFilter)
 	return stats, state, true, nil
 }
 
-func projectionReadState(ctx context.Context, tx *sql.Tx) (State, bool, bool, error) {
+func projectionReadState(ctx context.Context, tx *dialect.Tx) (State, bool, bool, error) {
 	state, err := stateQuery(ctx, tx, ProjectionRollupName)
 	if err != nil {
 		return State{}, false, false, err

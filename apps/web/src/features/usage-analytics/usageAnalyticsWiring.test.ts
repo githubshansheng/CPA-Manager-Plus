@@ -316,7 +316,7 @@ const usageAnalyticsPageImport = `import { UsageAnalyticsPage } from '${[
 ].join('/')}';`;
 
 describe('usage analytics app wiring', () => {
-  it('registers /usage-analytics behind the request monitoring gate', () => {
+  it('registers /usage-analytics behind the Manager monitoring-page gate', () => {
     expect(routesSource).toContain(usageAnalyticsPageImport);
     const usageRouteIndex = routesSource.indexOf("path: '/usage-analytics'");
     const usageRouteSource = routesSource.slice(
@@ -325,14 +325,26 @@ describe('usage analytics app wiring', () => {
     );
 
     expect(usageRouteIndex).toBeGreaterThanOrEqual(0);
-    expect(usageRouteSource).toContain('<FeatureGate feature="requestMonitoring">');
+    expect(usageRouteSource).toContain('<FeatureGate feature="managerMonitoringPages">');
     expect(usageRouteSource).toContain('<UsageAnalyticsPage />');
     expect(routesSource.indexOf("path: '/usage-analytics'")).toBeLessThan(
       routesSource.indexOf("path: '/monitoring'")
     );
   });
 
-  it('places Usage Analytics in the top-level sidebar between dashboard and monitoring when monitoring is available', () => {
+  it('keeps the main Request Monitor route accessible for its disabled-state guidance', () => {
+    const monitoringRouteIndex = routesSource.indexOf("path: '/monitoring'");
+    const monitoringRouteSource = routesSource.slice(
+      monitoringRouteIndex,
+      routesSource.indexOf("path: '/monitoring/account-actions'")
+    );
+
+    expect(monitoringRouteIndex).toBeGreaterThanOrEqual(0);
+    expect(monitoringRouteSource).toContain('<FeatureGate feature="managerMonitoringPages">');
+    expect(monitoringRouteSource).toContain('<MonitoringCenterPage />');
+  });
+
+  it('keeps Usage Analytics and Request Monitor visible whenever Manager Server is available', () => {
     const dashboardIndex = layoutSource.indexOf('const dashboardNavItem: NavItem = {');
     const usageIndex = layoutSource.indexOf(
       '...(usageAnalyticsNavItem ? [usageAnalyticsNavItem] : [])'
@@ -342,7 +354,10 @@ describe('usage analytics app wiring', () => {
     );
 
     expect(layoutSource).toContain(
-      'const usageAnalyticsNavItem = featureAvailability.requestMonitoringAvailable'
+      'const usageAnalyticsNavItem = featureAvailability.managerServiceAvailable'
+    );
+    expect(layoutSource).toContain(
+      'const monitoringNavItem = featureAvailability.managerServiceAvailable'
     );
     expect(layoutSource).toContain("path: '/usage-analytics'");
     expect(layoutSource).toContain("label: t('nav.usage_analytics')");

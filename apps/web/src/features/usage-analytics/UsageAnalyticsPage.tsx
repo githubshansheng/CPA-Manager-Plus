@@ -2548,6 +2548,17 @@ function UsageAnalyticsPageInner() {
     { value: 'miss', label: t('usage_analytics.cache_status_miss') },
   ];
   const noData = !usage.loading && !usage.error && !hasUsageData(usage.summary, usage.timeline);
+  const monitoringUnavailable = !usage.loading && Boolean(usage.unavailableReason);
+  const monitoringUnavailableTitle =
+    usage.unavailableReason === 'monitoring_disabled'
+      ? t('monitoring.request_monitoring_disabled_title')
+      : t('monitoring.request_monitoring_unavailable_title');
+  const monitoringUnavailableBody =
+    usage.unavailableReason === 'monitoring_disabled'
+      ? t('monitoring.request_monitoring_disabled_body')
+      : usage.unavailableReason === 'service_unavailable'
+        ? t('monitoring.request_monitoring_service_unavailable_body')
+        : t('monitoring.request_monitoring_not_configured_body');
   const rankRowLimit = 8;
   const credentialRankRowLimit = 10;
   const apiKeyRankContext =
@@ -2718,6 +2729,14 @@ function UsageAnalyticsPageInner() {
       )
     );
   };
+
+  if (monitoringUnavailable) {
+    return (
+      <div className={styles.page}>
+        <EmptyState title={monitoringUnavailableTitle} body={monitoringUnavailableBody} />
+      </div>
+    );
+  }
 
   return (
     <div className={styles.page}>
