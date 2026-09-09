@@ -13,6 +13,7 @@ $PidFile = if ($env:CPA_MANAGER_PLUS_PID_FILE) { $env:CPA_MANAGER_PLUS_PID_FILE 
 $LogFile = if ($env:CPA_MANAGER_PLUS_LOG_FILE) { $env:CPA_MANAGER_PLUS_LOG_FILE } else { Join-Path $LogDir "$AppName.log" }
 $ErrLogFile = if ($env:CPA_MANAGER_PLUS_ERR_LOG_FILE) { $env:CPA_MANAGER_PLUS_ERR_LOG_FILE } else { Join-Path $LogDir "$AppName.err.log" }
 $CurrentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$UseFileSystemAclExtensions = $null -ne ('System.IO.FileSystemAclExtensions' -as [type])
 
 function Show-Usage {
   Write-Host @"
@@ -82,6 +83,46 @@ function Test-ReparsePoint {
   return [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }
 
+function Get-DirectoryAccessControl {
+  param([string]$Path)
+
+  if ($UseFileSystemAclExtensions) {
+    return [System.IO.FileSystemAclExtensions]::GetAccessControl(
+      [System.IO.DirectoryInfo]::new($Path)
+    )
+  }
+  return [System.IO.Directory]::GetAccessControl($Path)
+}
+
+function Set-PathAccessControl {
+  param(
+    [string]$Path,
+    [System.Security.AccessControl.FileSystemSecurity]$Acl,
+    [switch]$Directory
+  )
+
+  if ($UseFileSystemAclExtensions) {
+    if ($Directory) {
+      [System.IO.FileSystemAclExtensions]::SetAccessControl(
+        [System.IO.DirectoryInfo]::new($Path),
+        [System.Security.AccessControl.DirectorySecurity]$Acl
+      )
+    } else {
+      [System.IO.FileSystemAclExtensions]::SetAccessControl(
+        [System.IO.FileInfo]::new($Path),
+        [System.Security.AccessControl.FileSecurity]$Acl
+      )
+    }
+    return
+  }
+
+  if ($Directory) {
+    [System.IO.Directory]::SetAccessControl($Path, $Acl)
+  } else {
+    [System.IO.File]::SetAccessControl($Path, $Acl)
+  }
+}
+
 function Test-UnsafeWritableDirectoryAcl {
   param([string]$Path)
 
@@ -91,7 +132,7 @@ function Test-UnsafeWritableDirectoryAcl {
     Get-WellKnownSidValue -Type ([System.Security.Principal.WellKnownSidType]::BuiltinUsersSid)
   )
   $unsafeRights = [System.Security.AccessControl.FileSystemRights]'Write, WriteData, CreateFiles, AppendData, CreateDirectories, Delete, DeleteSubdirectoriesAndFiles, Modify, FullControl, ChangePermissions, TakeOwnership'
-  $acl = [System.IO.Directory]::GetAccessControl($Path)
+  $acl = Get-DirectoryAccessControl -Path $Path
 
   foreach ($rule in $acl.Access) {
     if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
@@ -192,11 +233,7 @@ function Set-PrivateAcl {
     [System.Security.AccessControl.AccessControlType]::Allow
   )
   [void]$acl.AddAccessRule($rule)
-  if ($Directory) {
-    [System.IO.Directory]::SetAccessControl($Path, $acl)
-  } else {
-    [System.IO.File]::SetAccessControl($Path, $acl)
-  }
+  Set-PathAccessControl -Path $Path -Acl $acl -Directory:$Directory
 }
 
 function Ensure-PrivateDirectory {
@@ -332,11 +369,16 @@ function Read-PidRecord {
   if (-not [int]::TryParse([string]$record.pid, [ref]$pidValue)) {
     return [pscustomobject]@{ Format = 'invalid' }
   }
+  $startTimeUtc = if ($record.startTimeUtc -is [datetime]) {
+    $record.startTimeUtc.ToUniversalTime().ToString('o')
+  } else {
+    [string]$record.startTimeUtc
+  }
 
   [pscustomobject]@{
     Format       = 'metadata'
     Pid          = $pidValue
-    StartTimeUtc = [string]$record.startTimeUtc
+    StartTimeUtc = $startTimeUtc
     BinaryPath   = [string]$record.binaryPath
     CommandLine  = [string]$record.commandLine
   }
@@ -354,7 +396,7 @@ function Get-PidRecordState {
 
   $snapshot = Get-ProcessSnapshot -ProcessId $record.Pid
   if (-not $snapshot) {
-    return [pscustomobject]@{ State = 'stale'; Record = $record }
+    return [pscustomobject]@{ State = 'stale'; Reason = 'process-missing'; Record = $record }
   }
 
   if ($record.Format -ne 'metadata' -or -not $record.StartTimeUtc) {
@@ -368,7 +410,12 @@ function Get-PidRecordState {
   # A matching PID with a different start time is a reused PID, not the
   # process described by this private metadata record.
   if ($snapshot.StartTimeUtc -ne $record.StartTimeUtc) {
-    return [pscustomobject]@{ State = 'stale'; Record = $record; Snapshot = $snapshot }
+    return [pscustomobject]@{
+      State = 'stale'
+      Reason = 'start-time-mismatch'
+      Record = $record
+      Snapshot = $snapshot
+    }
   }
 
   if ($record.BinaryPath -and $snapshot.BinaryPath) {
@@ -603,7 +650,13 @@ function Start-App {
   $processId = Start-DetachedProcess -AppArgs $AppArgs
   Start-Sleep -Seconds 1
 
-  if ((Write-PidRecord -ProcessId $processId) -and (Get-PidRecordState).State -eq 'active') {
+  $pidRecordWritten = Write-PidRecord -ProcessId $processId
+  $pidState = if ($pidRecordWritten) {
+    Get-PidRecordState
+  } else {
+    [pscustomobject]@{ State = 'snapshot-unavailable' }
+  }
+  if ($pidRecordWritten -and $pidState.State -eq 'active') {
     Write-Host "$AppName started with PID $processId"
     Write-Host "Log: $LogFile"
     Write-Host "Error log: $ErrLogFile"
@@ -612,7 +665,12 @@ function Start-App {
 
   Stop-Process -Id $processId -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
-  Write-Error "$AppName failed to start. Check logs: $LogFile and $ErrLogFile"
+  $pidFailure = if ($pidState.PSObject.Properties['Reason']) {
+    "$($pidState.State):$($pidState.Reason)"
+  } else {
+    $pidState.State
+  }
+  Write-Error "$AppName failed PID validation ($pidFailure). Check logs: $LogFile and $ErrLogFile"
 }
 
 function Stop-App {

@@ -38,6 +38,17 @@ const windowsPowerShell = () => {
   return 'powershell.exe';
 };
 
+const powerShellCore = () => {
+  if (process.platform !== 'win32') {
+    return null;
+  }
+  const result = spawnSync('where.exe', ['pwsh.exe'], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return null;
+  }
+  return result.stdout.split(/\r?\n/u).find(Boolean) ?? null;
+};
+
 const psQuote = (value) => `'${value.replace(/'/g, "''")}'`;
 
 const runUnixControl = (script, env, args, options = {}) =>
@@ -681,6 +692,97 @@ describe('native control scripts', () => {
           encoding: 'utf8',
         }
       );
+    }
+  }, 30000);
+
+  it('applies private runtime ACLs under PowerShell 7+', () => {
+    const pwsh = powerShellCore();
+    if (!pwsh) {
+      return;
+    }
+
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), 'cpamp-native-pwsh-'));
+    tempDirs.push(tempDir);
+    const privateDir = path.join(tempDir, 'private');
+    const privateFile = path.join(privateDir, 'runtime.json');
+    const privateKeyFile = path.join(privateDir, 'admin.key');
+    mkdirSync(privateDir, { recursive: true });
+    writeFileSync(privateFile, '{}\r\n');
+    writeFileSync(privateKeyFile, 'test-key\r\n');
+
+    const command = [
+      '$tokens = $null',
+      '$errors = $null',
+      `$ast = [System.Management.Automation.Language.Parser]::ParseFile(${psQuote(windowsControlScript)}, [ref]$tokens, [ref]$errors)`,
+      "foreach ($name in @('Set-PathAccessControl', 'Set-PrivateAcl')) {",
+      '  $functionAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)',
+      "  if (-not $functionAst) { throw 'ACL function not found' }",
+      '  Invoke-Expression $functionAst.Extent.Text',
+      '}',
+      '$CurrentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User',
+      "$UseFileSystemAclExtensions = $null -ne ('System.IO.FileSystemAclExtensions' -as [type])",
+      `Set-PrivateAcl -Path ${psQuote(privateDir)} -Directory`,
+      `Set-PrivateAcl -Path ${psQuote(privateFile)}`,
+      `$sourceAst = [System.Management.Automation.Language.Parser]::ParseFile(${psQuote(windowsSourceScript)}, [ref]$tokens, [ref]$errors)`,
+      "$sourceAclFunction = $sourceAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Set-PrivateFileAcl' }, $true)",
+      "if (-not $sourceAclFunction) { throw 'Source ACL function not found' }",
+      'Invoke-Expression $sourceAclFunction.Extent.Text',
+      `Set-PrivateFileAcl -Path ${psQuote(privateKeyFile)}`,
+      `$directoryAcl = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.DirectoryInfo]::new(${psQuote(privateDir)}))`,
+      `$fileAcl = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]::new(${psQuote(privateFile)}))`,
+      `$keyAcl = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]::new(${psQuote(privateKeyFile)}))`,
+      "if (-not $directoryAcl.AreAccessRulesProtected) { throw 'Directory ACL is not protected' }",
+      "if (-not $fileAcl.AreAccessRulesProtected) { throw 'File ACL is not protected' }",
+      "if (-not $keyAcl.AreAccessRulesProtected) { throw 'Key ACL is not protected' }",
+    ].join('; ');
+    const result = spawnSync(pwsh, ['-NoProfile', '-Command', command], {
+      encoding: 'utf8',
+    });
+
+    expect(result).toMatchObject({ status: 0 });
+  }, 10000);
+
+  it('tracks detached Windows processes under PowerShell 7+', () => {
+    const pwsh = powerShellCore();
+    if (!pwsh) {
+      return;
+    }
+
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), 'cpamp-native-pwsh-process-'));
+    tempDirs.push(tempDir);
+    const pidFile = path.join(tempDir, 'run', 'manager.pid');
+    const logFile = path.join(tempDir, 'logs', 'manager.log');
+    const errLogFile = path.join(tempDir, 'logs', 'manager.err.log');
+    const childScript = path.join(tempDir, 'child.js');
+    writeFileSync(childScript, 'setTimeout(() => {}, 30000);\r\n');
+
+    const env = {
+      ...process.env,
+      CPA_MANAGER_PLUS_BIN: process.execPath,
+      CPA_MANAGER_PLUS_PID_FILE: pidFile,
+      CPA_MANAGER_PLUS_LOG_FILE: logFile,
+      CPA_MANAGER_PLUS_ERR_LOG_FILE: errLogFile,
+    };
+    const invokeControl = (args) =>
+      spawnSync(
+        pwsh,
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', windowsControlScript, ...args],
+        { env, encoding: 'utf8' }
+      );
+    const assertSucceeded = (result) => {
+      if (result.status !== 0) {
+        throw new Error(
+          [result.error?.message, result.stdout, result.stderr].filter(Boolean).join('\n')
+        );
+      }
+    };
+
+    try {
+      assertSucceeded(invokeControl(['start', childScript]));
+      assertSucceeded(invokeControl(['status']));
+      assertSucceeded(invokeControl(['stop']));
+    } finally {
+      invokeControl(['stop']);
     }
   }, 30000);
 

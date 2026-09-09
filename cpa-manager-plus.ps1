@@ -207,7 +207,14 @@ function Set-PrivateFileAcl {
         [System.Security.AccessControl.AccessControlType]::Allow
     )
     [void]$acl.AddAccessRule($rule)
-    [System.IO.File]::SetAccessControl($Path, $acl)
+    if ($null -ne ('System.IO.FileSystemAclExtensions' -as [type])) {
+        [System.IO.FileSystemAclExtensions]::SetAccessControl(
+            [System.IO.FileInfo]::new($Path),
+            $acl
+        )
+    } else {
+        [System.IO.File]::SetAccessControl($Path, $acl)
+    }
 }
 
 function Write-PrivateTextFile {
