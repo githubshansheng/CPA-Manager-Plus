@@ -360,6 +360,8 @@ describe('useAuthStore v1 obfuscation persistence gate and v2 migration', () => 
     clearConfigCacheMock.mockClear();
     clearModelsCacheMock.mockClear();
     usageServiceGetManagerConfigMock.mockReset();
+    usageServiceGetStatusMock.mockReset();
+    usageServiceGetStatusMock.mockResolvedValue({});
     storage = createMemoryStorage();
     vi.stubGlobal('localStorage', storage);
     vi.stubGlobal('window', createStubWindow(TEST_HOST));
